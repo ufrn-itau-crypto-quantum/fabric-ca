@@ -45,6 +45,23 @@ import (
 	"github.com/spf13/viper"
 )
 
+func getTLSKeyLogWriter() io.Writer {
+	path := os.Getenv("SSLKEYLOGFILE")
+	if path == "" {
+		fmt.Println("DEBUG-KEYLOG(server.go): SSLKEYLOGFILE vazio")
+		return nil
+	}
+
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		fmt.Printf("DEBUG-KEYLOG(server.go): erro ao abrir %s: %v\n", path, err)
+		return nil
+	}
+
+	fmt.Printf("DEBUG-KEYLOG(server.go): arquivo aberto com sucesso: %s\n", path)
+	return f
+}
+
 const (
 	defaultClientAuth         = "noclientcert"
 	fabricCAServerProfilePort = "FABRIC_CA_SERVER_PROFILE_PORT"
@@ -677,6 +694,7 @@ func (s *Server) listenAndServe() (err error) {
 			MinVersion:   tls.VersionTLS12,
 			MaxVersion:   tls.VersionTLS13,
 			CipherSuites: stls.DefaultCipherSuites,
+			KeyLogWriter: getTLSKeyLogWriter(),
 		}
 
 		listener, err = tls.Listen("tcp", addr, config)
