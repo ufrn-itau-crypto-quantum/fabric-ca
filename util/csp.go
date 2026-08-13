@@ -9,6 +9,7 @@ package util
 import (
 	"crypto"
 	"crypto/ecdsa"
+	"crypto/mldsa"
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
@@ -103,7 +104,7 @@ func BccspBackedSigner(caFile, keyFile string, policy *config.Signing, csp bccsp
 }
 
 // getBCCSPKeyOpts generates a key as specified in the request.
-// This supports ECDSA and RSA.
+// This supports ECDSA, RSA and ML-DSA.
 func getBCCSPKeyOpts(kr *csr.KeyRequest, ephemeral bool) (opts bccsp.KeyGenOpts, err error) {
 	if kr == nil {
 		return &bccsp.ECDSAKeyGenOpts{Temporary: ephemeral}, nil
@@ -134,6 +135,19 @@ func getBCCSPKeyOpts(kr *csr.KeyRequest, ephemeral bool) (opts bccsp.KeyGenOpts,
 			return nil, errors.New("Unsupported ECDSA key size: 521")
 		default:
 			return nil, errors.Errorf("Invalid ECDSA key size: %d", kr.Size())
+		}
+	case AlgoMLDSA, AlgoMLDSAHybrid:
+		// In hybrid mode this is the ML-DSA half of the pair; the classical half goes
+		// through the "ecdsa" case above, with its own key request.
+		switch kr.Size() {
+		case 44:
+			return &bccsp.MLDSA44KeyGenOpts{Temporary: ephemeral}, nil
+		case 65:
+			return &bccsp.MLDSA65KeyGenOpts{Temporary: ephemeral}, nil
+		case 87:
+			return &bccsp.MLDSA87KeyGenOpts{Temporary: ephemeral}, nil
+		default:
+			return nil, errors.Errorf("Invalid MLDSA key size: %d", kr.Size())
 		}
 	default:
 		return nil, errors.Errorf("Invalid algorithm: %s", kr.Algo())
@@ -188,9 +202,66 @@ func GetSignerFromCertFile(certFile string, csp bccsp.BCCSP) (bccsp.Key, crypto.
 
 // BCCSPKeyRequestGenerate generates keys through BCCSP
 // somewhat mirroring to cfssl/req.KeyRequest.Generate()
+//
+// The returned bccsp.Key is always the key that matches the certificate's
+// SubjectPublicKeyInfo, so callers can keep locating the private key by the certificate's SKI.
+// For a hybrid request that is the classical key; use BCCSPKeyRequestGenerateHybrid when the
+// ML-DSA key is also needed.
 func BCCSPKeyRequestGenerate(req *csr.CertificateRequest, myCSP bccsp.BCCSP) (bccsp.Key, crypto.Signer, error) {
-	log.Infof("generating key: %+v", req.KeyRequest)
-	keyOpts, err := getBCCSPKeyOpts(req.KeyRequest, false)
+	key, _, cspSigner, err := BCCSPKeyRequestGenerateHybrid(req, myCSP)
+	return key, cspSigner, err
+}
+
+// BCCSPKeyRequestGenerateHybrid generates the key material for a certificate request.
+//
+// It returns (key, pqcKey, signer), where key always backs the certificate's
+// SubjectPublicKeyInfo and signer always signs with key:
+//
+//   - classical request (ecdsa, rsa): (classicalKey, nil, classicalSigner)
+//   - pure ML-DSA ("mldsa"):          (mldsaKey, nil, mldsaSigner)
+//   - hybrid ("mldsa-hybrid"):        (classicalKey, mldsaKey, classicalSigner), with the
+//     ML-DSA public key meant to be carried in the altSubjectPublicKeyInfo extension
+//     (see util/hybrid.go)
+func BCCSPKeyRequestGenerateHybrid(req *csr.CertificateRequest, myCSP bccsp.BCCSP) (bccsp.Key, bccsp.Key, crypto.Signer, error) {
+	var keyReq *csr.KeyRequest
+	if req != nil {
+		keyReq = req.KeyRequest
+	}
+
+	if !IsHybridKeyRequest(keyReq) {
+		key, cspSigner, err := bccspKeyRequestGenerate(keyReq, myCSP)
+		return key, nil, cspSigner, err
+	}
+
+	level, err := MLDSALevel(keyReq.Size())
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	classicKeyReq, err := ClassicKeyRequestForLevel(level)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	log.Infof("generating hybrid key: ML-DSA-%d paired with %s-%d", level, classicKeyReq.A, classicKeyReq.S)
+
+	pqcOpts, err := getBCCSPKeyOpts(keyReq, false)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	keyPqc, err := myCSP.KeyGen(pqcOpts)
+	if err != nil {
+		return nil, nil, nil, errors.WithMessage(err, "Failed generating ML-DSA key")
+	}
+
+	keyClassic, cspSigner, err := bccspKeyRequestGenerate(classicKeyReq, myCSP)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return keyClassic, keyPqc, cspSigner, nil
+}
+
+func bccspKeyRequestGenerate(keyReq *csr.KeyRequest, myCSP bccsp.BCCSP) (bccsp.Key, crypto.Signer, error) {
+	log.Infof("generating key: %+v", keyReq)
+	keyOpts, err := getBCCSPKeyOpts(keyReq, false)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -224,6 +295,16 @@ func ImportBCCSPKeyFromPEM(keyFile string, myCSP bccsp.BCCSP, temporary bool) (b
 		sk, err := myCSP.KeyImport(priv, &bccsp.ECDSAPrivateKeyImportOpts{Temporary: temporary})
 		if err != nil {
 			return nil, errors.WithMessage(err, fmt.Sprintf("Failed to import ECDSA private key for '%s'", keyFile))
+		}
+		return sk, nil
+	case *mldsa.PrivateKey:
+		priv, err := x509.MarshalPKCS8PrivateKey(key)
+		if err != nil {
+			return nil, errors.WithMessage(err, fmt.Sprintf("Failed to convert ML-DSA private key for '%s'", keyFile))
+		}
+		sk, err := myCSP.KeyImport(priv, &bccsp.MLDSAPrivateKeyImportOpts{Temporary: temporary})
+		if err != nil {
+			return nil, errors.WithMessage(err, fmt.Sprintf("Failed to import ML-DSA private key for '%s'", keyFile))
 		}
 		return sk, nil
 	case *rsa.PrivateKey:

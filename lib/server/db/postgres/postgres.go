@@ -188,7 +188,9 @@ func (p *Postgres) createTables() error {
 		return errors.Wrap(err, "Error creating affiliations table")
 	}
 	log.Debug("Creating certificates table if it does not exist")
-	if _, err := db.Exec("CreateCertificatesTable", "CREATE TABLE IF NOT EXISTS certificates (id VARCHAR(255), serial_number bytea NOT NULL, authority_key_identifier bytea NOT NULL, ca_label bytea, status bytea NOT NULL, reason int, expiry timestamp, revoked_at timestamp, pem bytea NOT NULL, level INTEGER DEFAULT 0, PRIMARY KEY(serial_number, authority_key_identifier))"); err != nil {
+	// issued_at, not_before, metadata, sans and common_name are read and written by the
+	// cfssl certdb accessor; without them every query it issues fails with a missing column.
+	if _, err := db.Exec("CreateCertificatesTable", "CREATE TABLE IF NOT EXISTS certificates (id VARCHAR(255), serial_number bytea NOT NULL, authority_key_identifier bytea NOT NULL, ca_label bytea, status bytea NOT NULL, reason int, expiry timestamp, revoked_at timestamp, pem bytea NOT NULL, level INTEGER DEFAULT 0, issued_at timestamp, not_before timestamp, metadata TEXT, sans TEXT, common_name TEXT, PRIMARY KEY(serial_number, authority_key_identifier))"); err != nil {
 		return errors.Wrap(err, "Error creating certificates table")
 	}
 	log.Debug("Creating credentials table if it does not exist")

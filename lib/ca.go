@@ -8,10 +8,14 @@ package lib
 
 import (
 	"bytes"
+	"crypto"
 	"crypto/dsa"
 	"crypto/ecdsa"
+	"crypto/mldsa"
 	"crypto/rsa"
 	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"os"
@@ -348,18 +352,94 @@ func (ca *CA) getCACert() (cert []byte, err error) {
 			SerialNumber: csr.SerialNumber,
 		}
 		log.Debugf("Root CA certificate request: %+v", req)
-		// Generate the key/signer
-		_, cspSigner, err := util.BCCSPKeyRequestGenerate(&req, ca.csp)
+		// Generate the key/signer. For a hybrid request this yields a classical key (which
+		// backs the SubjectPublicKeyInfo and signs the certificate) plus an ML-DSA key; for
+		// a pure ML-DSA request the ML-DSA key does both.
+		_, pqcKey, cspSigner, err := util.BCCSPKeyRequestGenerateHybrid(&req, ca.csp)
 		if err != nil {
 			return nil, err
 		}
-		// Call CFSSL to initialize the CA
-		cert, _, err = initca.NewFromSigner(&req, cspSigner)
+
+		// If this is a hybrid request, carry the ML-DSA public key in the
+		// altSubjectPublicKeyInfo extension.
+		var extensions []pkix.Extension
+		if pqcKey != nil {
+			pqcPub, err := pqcKey.PublicKey()
+			if err != nil {
+				return nil, errors.WithMessage(err, "Failed to get ML-DSA public key")
+			}
+			ext, err := util.MarshalAltPublicKeyExtension(pqcPub)
+			if err != nil {
+				return nil, err
+			}
+			extensions = append(extensions, ext)
+		}
+
+		cert, err = newSelfSignedCACert(&req, cspSigner, extensions)
 		if err != nil {
 			return nil, errors.WithMessage(err, "Failed to create new CA certificate")
 		}
 	}
 	return cert, nil
+}
+
+// newSelfSignedCACert creates a self-signed root CA certificate.
+//
+// This mirrors cfssl's initca.NewFromSigner, but builds its own signing policy so that extra
+// extensions can actually reach the certificate. initca.CAPolicy() has neither CopyExtensions
+// nor an ExtensionWhitelist, and initca.NewFromSigner builds its SignRequest without the
+// Extensions field, so extensions attached to the CSR are silently dropped by
+// signer.ParseCertificateRequest. Passing them through SignRequest.Extensions and whitelisting
+// the OID is the same mechanism the enrollment path uses (see initSigningProfile).
+//
+// It also uses util.GenerateCSR rather than cfssl's csr.Generate, which rejects ML-DSA keys.
+func newSelfSignedCACert(req *cfcsr.CertificateRequest, priv crypto.Signer, extensions []pkix.Extension) ([]byte, error) {
+	policy := initca.CAPolicy()
+	if req.CA != nil {
+		if req.CA.Expiry != "" {
+			expiry, err := time.ParseDuration(req.CA.Expiry)
+			if err != nil {
+				return nil, err
+			}
+			policy.Default.ExpiryString = req.CA.Expiry
+			policy.Default.Expiry = expiry
+		}
+		policy.Default.CAConstraint.MaxPathLen = req.CA.PathLength
+		if req.CA.PathLength != 0 && req.CA.PathLenZero {
+			log.Infof("ignore invalid 'pathlenzero' value")
+		} else {
+			policy.Default.CAConstraint.MaxPathLenZero = req.CA.PathLenZero
+		}
+	}
+
+	// Authorize the extensions we are about to request. The whitelist is checked in
+	// cfssl's local.Signer.Sign, which rejects the whole request for any OID not listed.
+	signerExts := make([]signer.Extension, 0, len(extensions))
+	for _, ext := range extensions {
+		if policy.Default.ExtensionWhitelist == nil {
+			policy.Default.ExtensionWhitelist = map[string]bool{}
+		}
+		policy.Default.ExtensionWhitelist[ext.Id.String()] = true
+		signerExts = append(signerExts, signer.Extension{
+			ID:       config.OID(ext.Id),
+			Critical: ext.Critical,
+			// cfssl hex-decodes this value before building the pkix.Extension.
+			Value: hex.EncodeToString(ext.Value),
+		})
+	}
+
+	csrPEM, err := util.GenerateCSR(priv, req)
+	if err != nil {
+		return nil, err
+	}
+	s, err := cflocalsigner.NewSigner(priv, nil, signer.DefaultSigAlgo(priv), policy)
+	if err != nil {
+		return nil, err
+	}
+	return s.Sign(signer.SignRequest{
+		Request:    string(csrPEM),
+		Extensions: signerExts,
+	})
 }
 
 // Return a certificate chain which is the concatenation of chain and cert
@@ -1179,6 +1259,15 @@ func validateMatchingKeys(cert *x509.Certificate, keyFile string) error {
 		if privKey.PublicKey.X.Cmp(pubKey.X) != 0 {
 			return errors.New("Public key and private key do not match")
 		}
+	case *mldsa.PublicKey:
+		privKey, err := util.GetMLDSAPrivateKey(keyPEM)
+		if err != nil {
+			return err
+		}
+
+		if !privKey.PublicKey().Equal(pubKey) {
+			return errors.New("Public key and private key do not match")
+		}
 	}
 
 	return nil
@@ -1279,6 +1368,10 @@ func initSigningProfile(spp **config.SigningProfile, expiry time.Duration, isCA 
 	}
 	// This is set so that all profiles permit an attribute extension in CFSSL
 	sp.ExtensionWhitelist[attrmgr.AttrOIDString] = true
+	// Permit the alternative public key extension of a hybrid certificate. A single OID
+	// covers all three ML-DSA levels, since the level is carried by the AlgorithmIdentifier
+	// inside the extension value.
+	sp.ExtensionWhitelist[util.OIDAltSubjectPublicKeyInfo.String()] = true
 }
 
 func getMigrator(driverName string, tx cadb.FabricCATx, curLevels, srvLevels *dbutil.Levels) (cadb.Migrator, error) {

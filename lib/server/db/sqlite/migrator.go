@@ -7,6 +7,8 @@ SPDX-License-Identifier: Apache-2.0
 package sqlite
 
 import (
+	"strings"
+
 	"github.com/cloudflare/cfssl/log"
 	"github.com/hyperledger/fabric-ca/lib/server/db"
 	"github.com/hyperledger/fabric-ca/lib/server/db/util"
@@ -129,6 +131,26 @@ func (m *Migrator) MigrateCertificatesTable() error {
 		_, err = tx.Exec(funcName, "DROP TABLE certificates_old")
 		if err != nil {
 			return err
+		}
+		fallthrough
+
+	case 1:
+		log.Debug("Upgrade certificates table to level 2")
+		// Columns the cfssl certdb accessor selects and inserts. SQLite supports ADD COLUMN,
+		// so the rename/copy dance of level 1 is not needed here. A database coming from
+		// level 0 arrives here with the table already recreated from the current schema, so
+		// an existing column is expected rather than an error.
+		for _, column := range []string{
+			"issued_at timestamp",
+			"not_before timestamp",
+			"metadata blob",
+			"sans blob",
+			"common_name blob",
+		} {
+			_, err := tx.Exec(funcName, "ALTER TABLE certificates ADD COLUMN "+column)
+			if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+				return err
+			}
 		}
 		fallthrough
 

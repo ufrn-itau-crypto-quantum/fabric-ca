@@ -24,7 +24,7 @@ const (
 	// AffiliationLevel is the current level of affiliations
 	AffiliationLevel = 1
 	// CertificateLevel is the current level of certificates
-	CertificateLevel = 1
+	CertificateLevel = 2
 )
 
 // Version specifies fabric-ca-client/fabric-ca-server version
@@ -77,6 +77,12 @@ var versionToLevelsMapping = []versionLevels{
 	{
 		version: "1.4.0",
 		levels:  &db.Levels{Identity: 2, Affiliation: 1, Certificate: 1, Credential: 1, RAInfo: 1, Nonce: 1},
+	},
+	{
+		// The cfssl certdb accessor gained the issued_at, not_before, metadata, sans and
+		// common_name columns, so the certificates table has to carry them.
+		version: "1.5.21",
+		levels:  &db.Levels{Identity: 2, Affiliation: 1, Certificate: 2, Credential: 1, RAInfo: 1, Nonce: 1},
 	},
 }
 

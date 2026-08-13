@@ -142,8 +142,11 @@ func (i *Identity) Reenroll(req *api.ReenrollmentRequest) (*EnrollmentResponse, 
 			if err != nil {
 				return nil, err
 			}
-			key = val.(*x509.Signer).Key()
-			csrPEM, key, err = i.client.GenCSRUsingKey(req.CSR, i.GetName(), key)
+			signer := val.(*x509.Signer)
+			key = signer.Key()
+			// The previous certificate is what carries the ML-DSA public key of a hybrid
+			// identity, so it is needed to keep the extension across a key-reusing reenroll.
+			csrPEM, key, err = i.client.GenCSRUsingKeyAndCert(req.CSR, i.GetName(), key, signer.GetX509Cert())
 			if err != nil {
 				return nil, err
 			}

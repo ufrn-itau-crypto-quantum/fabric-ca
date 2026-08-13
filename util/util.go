@@ -9,6 +9,7 @@ package util
 import (
 	"bytes"
 	"crypto/ecdsa"
+	"crypto/mldsa"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/base64"
@@ -273,6 +274,24 @@ func decodeToken(token string) (*x509.Certificate, string, string, error) {
 		return nil, "", "", errors.WithMessage(err, "Error in parsing x509 certificate given block bytes")
 	}
 	return x509Cert, b64cert, parts[1], nil
+}
+
+// GetMLDSAPrivateKey gets an *mldsa.PrivateKey from a PEM-encoded key. crypto/mldsa keys are
+// always PKCS#8; the parameter set comes from the algorithm OID inside the encoding.
+func GetMLDSAPrivateKey(raw []byte) (*mldsa.PrivateKey, error) {
+	decoded, _ := pem.Decode(raw)
+	if decoded == nil {
+		return nil, errors.New("Failed to decode the PEM-encoded ML-DSA key")
+	}
+	key, err := x509.ParsePKCS8PrivateKey(decoded.Bytes)
+	if err != nil {
+		return nil, errors.Wrap(err, "Failed parsing ML-DSA private key")
+	}
+	mldsaKey, ok := key.(*mldsa.PrivateKey)
+	if !ok {
+		return nil, errors.Errorf("Expecting ML-DSA private key but found %T", key)
+	}
+	return mldsaKey, nil
 }
 
 // GetECPrivateKey get *ecdsa.PrivateKey from key pem
