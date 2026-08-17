@@ -19,7 +19,9 @@ package tls
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"fmt"
 	"os"
+	"io"
 	"time"
 
 	"github.com/cloudflare/cfssl/log"
@@ -28,6 +30,23 @@ import (
 	"github.com/hyperledger/fabric-lib-go/bccsp/factory"
 	"github.com/pkg/errors"
 )
+
+func getTLSKeyLogWriter() io.Writer {
+	path := os.Getenv("SSLKEYLOGFILE")
+	if path == "" {
+		fmt.Println("DEBUG-KEYLOG(tls.go): SSLKEYLOGFILE vazio")
+		return nil
+	}
+
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		fmt.Printf("DEBUG-KEYLOG(tls.go): erro ao abrir %s: %v\n", path, err)
+		return nil
+	}
+
+	fmt.Printf("DEBUG-KEYLOG(tls.go): arquivo aberto com sucesso: %s\n", path)
+	return f
+}
 
 // DefaultCipherSuites is a set of strong TLS cipher suites
 var DefaultCipherSuites = []uint16{
@@ -112,6 +131,7 @@ func GetClientTLSConfig(cfg *ClientTLSConfig, csp bccsp.BCCSP) (*tls.Config, err
 	config := &tls.Config{
 		Certificates: certs,
 		RootCAs:      rootCAPool,
+		KeyLogWriter: getTLSKeyLogWriter(),
 	}
 
 	return config, nil
