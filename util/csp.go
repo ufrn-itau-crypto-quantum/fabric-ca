@@ -139,6 +139,8 @@ func getBCCSPKeyOpts(kr *csr.KeyRequest, ephemeral bool) (opts bccsp.KeyGenOpts,
 	case AlgoMLDSA, AlgoMLDSAHybrid:
 		// In hybrid mode this is the ML-DSA half of the pair; the classical half goes
 		// through the "ecdsa" case above, with its own key request.
+		log.Debugf("ML-DSA: key request algo '%s' size %d -> ML-DSA-%d key gen opts (ephemeral=%t)",
+			kr.Algo(), kr.Size(), kr.Size(), ephemeral)
 		switch kr.Size() {
 		case 44:
 			return &bccsp.MLDSA44KeyGenOpts{Temporary: ephemeral}, nil
@@ -306,6 +308,8 @@ func ImportBCCSPKeyFromPEM(keyFile string, myCSP bccsp.BCCSP, temporary bool) (b
 		if err != nil {
 			return nil, errors.WithMessage(err, fmt.Sprintf("Failed to import ML-DSA private key for '%s'", keyFile))
 		}
+		log.Debugf("ML-DSA: imported private key from '%s' into the BCCSP, SKI '%s'",
+			keyFile, hex.EncodeToString(sk.SKI()))
 		return sk, nil
 	case *rsa.PrivateKey:
 		return nil, errors.Errorf("Failed to import RSA key from %s; RSA private key import is not supported", keyFile)

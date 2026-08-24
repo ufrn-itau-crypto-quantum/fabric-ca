@@ -159,16 +159,42 @@ func CreateToken(csp bccsp.BCCSP, cert []byte, key bccsp.Key, method, uri string
 			}
 	*/
 	case *ecdsa.PublicKey:
+		log.Debugf("CreateToken: signing %s %s with the certificate's ECDSA key", method, uri)
 		token, err = GenECDSAToken(csp, cert, key, method, uri, body)
 		if err != nil {
 			return "", err
 		}
+	case *mldsa.PublicKey:
+		log.Debugf("CreateToken: signing %s %s with the certificate's ML-DSA key", method, uri)
+		token, err = GenMLDSAToken(csp, cert, key, method, uri, body)
+		if err != nil {
+			return "", err
+		}
+	default:
+		return "", errors.Errorf("Unsupported public key type %T for token generation", publicKey)
 	}
 	return token, nil
 }
 
 // GenECDSAToken signs the http method, uri, body, and cert with ECDSA using EC private key
 func GenECDSAToken(csp bccsp.BCCSP, cert []byte, key bccsp.Key, method, uri string, body []byte) (string, error) {
+	return genToken(csp, cert, key, method, uri, body)
+}
+
+// GenMLDSAToken signs the http method, uri, body, and cert with the ML-DSA private key
+// matching a pure ML-DSA certificate.
+//
+// The payload and token layout must stay the ones GenECDSAToken produces: VerifyToken rebuilds
+// the same payload and hands its digest to csp.Verify. Signing anything else here would only
+// verify against a server patched to match.
+//
+// Hybrid certificates do not come through here; their SubjectPublicKeyInfo is classical, so
+// they take the ECDSA branch of CreateToken.
+func GenMLDSAToken(csp bccsp.BCCSP, cert []byte, key bccsp.Key, method, uri string, body []byte) (string, error) {
+	return genToken(csp, cert, key, method, uri, body)
+}
+
+func genToken(csp bccsp.BCCSP, cert []byte, key bccsp.Key, method, uri string, body []byte) (string, error) {
 	b64body := B64Encode(body)
 	b64cert := B64Encode(cert)
 	b64uri := B64Encode([]byte(uri))

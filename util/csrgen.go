@@ -26,12 +26,10 @@ import (
 
 // GenerateCSR creates a PEM encoded CSR from a CertificateRequest and an existing key.
 //
-// It replaces cfssl's csr.Generate, which cannot be used with an ML-DSA key: it starts by
-// calling helpers.SignerAlgo, which knows only RSA and ECDSA and returns
-// UnknownSignatureAlgorithm for anything else, and then hard-fails on that value. The rest of
-// this function is a faithful copy of csr.GenerateDER/csr.Generate; only the signature
-// algorithm decision differs. Patching the vendored cfssl was avoided on purpose, the same way
-// newSelfSignedCACert replicates initca.NewFromSigner instead of changing it.
+// It replaces cfssl's csr.Generate, which hard-fails on an ML-DSA key because helpers.SignerAlgo
+// knows only RSA and ECDSA. Apart from the signature algorithm decision, this is a copy of
+// csr.GenerateDER/csr.Generate; the vendored cfssl is left untouched, as newSelfSignedCACert
+// also does with initca.NewFromSigner.
 func GenerateCSR(priv crypto.Signer, req *csr.CertificateRequest) ([]byte, error) {
 	der, err := generateCSRDER(priv, req)
 	if err != nil {
@@ -100,14 +98,15 @@ func generateCSRDER(priv crypto.Signer, req *csr.CertificateRequest) ([]byte, er
 
 // csrSigAlgo picks the signature algorithm for a CSR.
 //
-// For an ML-DSA key it returns the zero value on purpose: crypto/x509 derives the algorithm
-// from the key's parameter set (signingParamsForKey maps MLDSA44/65/87), and there is no
-// choice to make, since a given parameter set admits exactly one signature algorithm.
+// For an ML-DSA key it returns the zero value, letting crypto/x509 derive the algorithm from
+// the key's parameter set; each parameter set admits exactly one signature algorithm.
 func csrSigAlgo(priv crypto.Signer) (x509.SignatureAlgorithm, error) {
 	if sigAlgo := helpers.SignerAlgo(priv); sigAlgo != x509.UnknownSignatureAlgorithm {
 		return sigAlgo, nil
 	}
-	if _, ok := priv.Public().(*mldsa.PublicKey); ok {
+	if pub, ok := priv.Public().(*mldsa.PublicKey); ok {
+		log.Debugf("ML-DSA: CSR key is %s; leaving the signature algorithm for crypto/x509 to derive",
+			pub.Parameters())
 		return x509.UnknownSignatureAlgorithm, nil
 	}
 	return x509.UnknownSignatureAlgorithm, cferr.New(cferr.PrivateKeyError, cferr.Unavailable)

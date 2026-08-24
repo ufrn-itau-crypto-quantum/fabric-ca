@@ -1260,6 +1260,8 @@ func validateMatchingKeys(cert *x509.Certificate, keyFile string) error {
 			return errors.New("Public key and private key do not match")
 		}
 	case *mldsa.PublicKey:
+		log.Debugf("ML-DSA: validating that the %s certificate and the stored key are a pair",
+			pubKey.Parameters())
 		privKey, err := util.GetMLDSAPrivateKey(keyPEM)
 		if err != nil {
 			return err

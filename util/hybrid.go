@@ -8,28 +8,16 @@ package util
 
 // ML-DSA support for certificates, in two modes selected by csr.keyrequest.algo:
 //
-//   - "mldsa"        pure ML-DSA. The SubjectPublicKeyInfo *is* the ML-DSA key. Possible
-//                    because crypto/mldsa (Go 1.27) is understood by crypto/x509 natively.
-//   - "mldsa-hybrid" hybrid ("alternative public key in extension"). The SubjectPublicKeyInfo
-//                    stays classical (ECDSA), so chain validation, TLS and verifiers that do
-//                    not know ML-DSA keep working unchanged, while the ML-DSA public key
-//                    travels in a non-critical X.509v3 extension.
+//   - "mldsa"        pure ML-DSA: the SubjectPublicKeyInfo is the ML-DSA key.
+//   - "mldsa-hybrid" hybrid: the SubjectPublicKeyInfo stays classical (ECDSA) and the ML-DSA
+//                    public key travels in a non-critical X.509v3 extension, so verifiers
+//                    that do not know ML-DSA keep working.
 //
-// Two distinct OID roles are involved in the hybrid mode, and mixing them up is the mistake
-// this file exists to avoid:
-//
-//   - The *extension* OID is 2.5.29.72 (altSubjectPublicKeyInfo), from ITU-T X.509 (2019).
-//   - The *algorithm* OIDs are the NIST ones for ML-DSA-44/65/87, and they live inside the
-//     extension value, in the AlgorithmIdentifier of a SubjectPublicKeyInfo.
-//
-// The extension value is exactly what x509.MarshalPKIXPublicKey produces for an
-// *mldsa.PublicKey, which is what clause 9.8 of X.509 asks for: a SubjectPublicKeyInfo. It is
-// self-describing, so a single extension OID covers all three parameter sets and the verifier
-// learns the level from the AlgorithmIdentifier rather than from the extension OID.
-//
-// Note on draft-ietf-lamps-pq-composite-sigs (Composite ML-DSA): its OIDs are *algorithm*
-// identifiers for a composite key carried in the SubjectPublicKeyInfo, and it defines no
-// extension-based mechanism. It therefore does not apply to the hybrid design here.
+// Two OID roles are involved in the hybrid mode and must not be confused: the extension OID
+// is 2.5.29.72 (altSubjectPublicKeyInfo, ITU-T X.509 (2019) clause 9.8), while the algorithm
+// OIDs for ML-DSA-44/65/87 live inside the extension value, in the AlgorithmIdentifier of the
+// SubjectPublicKeyInfo. A single extension OID therefore covers all three parameter sets, and
+// the verifier learns the level from the AlgorithmIdentifier.
 
 import (
 	"crypto"
@@ -40,6 +28,7 @@ import (
 	"encoding/hex"
 
 	"github.com/cloudflare/cfssl/csr"
+	"github.com/cloudflare/cfssl/log"
 	"github.com/hyperledger/fabric-lib-go/bccsp"
 	cspsigner "github.com/hyperledger/fabric-lib-go/bccsp/signer"
 	"github.com/pkg/errors"
@@ -92,8 +81,7 @@ func MLDSAParametersForLevel(level int) (mldsa.Parameters, error) {
 	}
 }
 
-// MLDSALevelForKey returns the security level of an ML-DSA public key. Parameters values
-// returned by mldsa.MLDSA44/65/87 are comparable, which is what makes this a plain switch.
+// MLDSALevelForKey returns the security level of an ML-DSA public key.
 func MLDSALevelForKey(pub *mldsa.PublicKey) (int, error) {
 	if pub == nil {
 		return 0, errors.New("ML-DSA public key is nil")
@@ -111,10 +99,8 @@ func MLDSALevelForKey(pub *mldsa.PublicKey) (int, error) {
 }
 
 // ClassicKeyRequestForLevel returns the classical key request to pair with an ML-DSA level in
-// hybrid mode. The classical key is what ends up in the certificate's SubjectPublicKeyInfo, so
-// it must be something the BCCSP and crypto/x509 both handle; the curve is chosen for
-// comparable strength. ECDSA P-521 is not supported by the BCCSP, so level 87 also pairs with
-// P-384.
+// hybrid mode, choosing a curve of comparable strength. Level 87 pairs with P-384 because the
+// BCCSP does not support P-521.
 func ClassicKeyRequestForLevel(level int) (*csr.KeyRequest, error) {
 	switch level {
 	case 44:
@@ -142,12 +128,15 @@ func MarshalAltPublicKeyExtension(pub bccsp.Key) (pkix.Extension, error) {
 
 // MarshalAltPublicKeyExtensionFromSPKI is MarshalAltPublicKeyExtension for a public key already
 // in SubjectPublicKeyInfo DER, such as one recovered from another certificate or from a CSR.
-// The value is validated by parsing it, so a malformed or non-ML-DSA key never reaches a
-// certificate.
+// The value is validated by parsing it before it can reach a certificate.
 func MarshalAltPublicKeyExtensionFromSPKI(spki []byte) (pkix.Extension, error) {
-	if _, err := MLDSAPublicKeyFromSPKI(spki); err != nil {
+	pub, err := MLDSAPublicKeyFromSPKI(spki)
+	if err != nil {
 		return pkix.Extension{}, err
 	}
+	level, _ := MLDSALevelForKey(pub)
+	log.Debugf("ML-DSA: emitting extension %s with an ML-DSA-%d key (%d bytes of SPKI)",
+		OIDAltSubjectPublicKeyInfo, level, len(spki))
 	return pkix.Extension{
 		Id:       OIDAltSubjectPublicKeyInfo,
 		Critical: false,
@@ -168,8 +157,6 @@ func MLDSAPublicKeyFromSPKI(spki []byte) (*mldsa.PublicKey, error) {
 	if !ok {
 		return nil, errors.Errorf("Alternative public key is not an ML-DSA key, got %T", pub)
 	}
-	// Rejects a parameter set crypto/x509 might learn to parse but that this code does not
-	// know how to size or name.
 	if _, err := MLDSALevelForKey(mldsaPub); err != nil {
 		return nil, err
 	}
@@ -178,8 +165,8 @@ func MLDSAPublicKeyFromSPKI(spki []byte) (*mldsa.PublicKey, error) {
 
 // ParseAltPublicKeyExtension looks for the altSubjectPublicKeyInfo extension and returns the
 // ML-DSA public key it carries, along with the raw SubjectPublicKeyInfo. It takes the extension
-// slice so it works on both a certificate (cert.Extensions) and a parsed CSR (csr.Extensions).
-// found is false, with no error, when the extension is simply absent.
+// slice so it works on both a certificate and a parsed CSR. found is false, with no error,
+// when the extension is absent.
 func ParseAltPublicKeyExtension(exts []pkix.Extension) (pub *mldsa.PublicKey, spki []byte, found bool, err error) {
 	for _, ext := range exts {
 		if !ext.Id.Equal(OIDAltSubjectPublicKeyInfo) {
@@ -187,10 +174,16 @@ func ParseAltPublicKeyExtension(exts []pkix.Extension) (pub *mldsa.PublicKey, sp
 		}
 		pub, err := MLDSAPublicKeyFromSPKI(ext.Value)
 		if err != nil {
+			log.Debugf("ML-DSA: extension %s present but unusable: %s", OIDAltSubjectPublicKeyInfo, err)
 			return nil, nil, true, err
 		}
+		level, _ := MLDSALevelForKey(pub)
+		log.Debugf("ML-DSA: found extension %s carrying an ML-DSA-%d key",
+			OIDAltSubjectPublicKeyInfo, level)
 		return pub, ext.Value, true, nil
 	}
+	log.Debugf("ML-DSA: no %s extension present; treating as a non-hybrid certificate",
+		OIDAltSubjectPublicKeyInfo)
 	return nil, nil, false, nil
 }
 
@@ -222,15 +215,16 @@ func GetAltPublicKeyBCCSPFromCert(cert *x509.Certificate, csp bccsp.BCCSP) (bccs
 // alternative public key carried by a certificate. It returns (nil, nil) when the certificate
 // carries no such extension.
 //
-// This is the hybrid counterpart of GetSignerFromCert, and it works for the same reason: the
-// BCCSP derives a private key's SKI from its public key, so the keystore can be searched
-// starting from a public key found in a certificate.
+// The lookup works because the BCCSP derives a private key's SKI from its public key, so the
+// keystore can be searched starting from the public key in the certificate.
 func GetAltSignerFromCert(cert *x509.Certificate, csp bccsp.BCCSP) (bccsp.Key, crypto.Signer, error) {
 	pub, err := GetAltPublicKeyBCCSPFromCert(cert, csp)
 	if err != nil || pub == nil {
 		return nil, nil, err
 	}
 	ski := pub.SKI()
+	log.Debugf("ML-DSA: looking up the alternative private key in the keystore, SKI '%s'",
+		hex.EncodeToString(ski))
 	privateKey, err := csp.GetKey(ski)
 	if err != nil {
 		return nil, nil, errors.WithMessage(err, "Could not find matching ML-DSA private key for SKI")
