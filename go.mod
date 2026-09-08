@@ -2,8 +2,6 @@ module github.com/hyperledger/fabric-ca
 
 go 1.27
 
-toolchain go1.27rc2
-
 require (
 	github.com/IBM/idemix v0.0.2-0.20240913182345-72941a5f41cd
 	github.com/IBM/idemix/bccsp/types v0.0.0-20240913182345-72941a5f41cd
