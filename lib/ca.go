@@ -52,6 +52,7 @@ import (
 	"github.com/hyperledger/fabric-ca/lib/tls"
 	"github.com/hyperledger/fabric-ca/util"
 	"github.com/hyperledger/fabric-lib-go/bccsp"
+	cspsigner "github.com/hyperledger/fabric-lib-go/bccsp/signer"
 	"github.com/pkg/errors"
 
 	"github.com/jinzhu/copier"
@@ -378,6 +379,19 @@ func (ca *CA) getCACert() (cert []byte, err error) {
 		cert, err = newSelfSignedCACert(&req, cspSigner, extensions)
 		if err != nil {
 			return nil, errors.WithMessage(err, "Failed to create new CA certificate")
+		}
+
+		// A root CA signs its own alternative signature, so the whole alternative chain has an
+		// anchor: without it the certificates below have nothing to be verified against.
+		if pqcKey != nil {
+			altSigner, err := cspsigner.New(ca.csp, pqcKey)
+			if err != nil {
+				return nil, errors.WithMessage(err, "Failed to create the ML-DSA signer of the CA")
+			}
+			cert, err = util.AddAlternativeSignature(cert, altSigner, cspSigner)
+			if err != nil {
+				return nil, errors.WithMessage(err, "Failed to add the alternative signature to the CA certificate")
+			}
 		}
 	}
 	return cert, nil
@@ -834,6 +848,38 @@ func (ca *CA) initEnrollmentSigner() (err error) {
 
 	// Successful enrollment
 	return nil
+}
+
+// addAlternativeSignature adds the ITU-T alternative signature to a certificate the CA has just
+// issued, and returns the rewritten PEM. It returns the certificate untouched when the CA
+// certificate carries no alternative public key, which is the case of a CA that was not
+// initialized in hybrid mode.
+//
+// The signature is added after cfssl has issued the certificate, because the serial number,
+// validity and extensions are only settled then. The stored record is updated with the rewritten
+// PEM, or the database would keep a certificate that differs from the one delivered.
+func (ca *CA) addAlternativeSignature(certPEM []byte) ([]byte, error) {
+	_, classical, caCert, err := util.GetSignerFromCertFile(ca.Config.CA.Certfile, ca.csp)
+	if err != nil {
+		return nil, errors.WithMessage(err, "Failed to load the CA signer")
+	}
+	_, alt, err := util.GetAltSignerFromCert(caCert, ca.csp)
+	if err != nil {
+		return nil, errors.WithMessage(err, "Failed to load the CA's alternative signer")
+	}
+	if alt == nil {
+		return certPEM, nil
+	}
+
+	rewritten, err := util.AddAlternativeSignature(certPEM, alt, classical)
+	if err != nil {
+		return nil, err
+	}
+	err = ca.certDBAccessor.UpdateCertificatePEM(rewritten)
+	if err != nil {
+		return nil, err
+	}
+	return rewritten, nil
 }
 
 // loadUsersTable adds the configured users to the table if not already found

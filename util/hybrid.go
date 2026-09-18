@@ -13,11 +13,14 @@ package util
 //                    public key travels in a non-critical X.509v3 extension, so verifiers
 //                    that do not know ML-DSA keep working.
 //
-// Two OID roles are involved in the hybrid mode and must not be confused: the extension OID
-// is 2.5.29.72 (altSubjectPublicKeyInfo, ITU-T X.509 (2019) clause 9.8), while the algorithm
-// OIDs for ML-DSA-44/65/87 live inside the extension value, in the AlgorithmIdentifier of the
-// SubjectPublicKeyInfo. A single extension OID therefore covers all three parameter sets, and
-// the verifier learns the level from the AlgorithmIdentifier.
+// The hybrid mode uses the three extensions of ITU-T X.509 (2019) clause 9.8: 2.5.29.72 carries
+// the alternative public key, 2.5.29.73 the algorithm of the alternative signature and 2.5.29.74
+// its value.
+//
+// Two OID roles are involved and must not be confused: those three are extension OIDs, while the
+// algorithm OIDs for ML-DSA-44/65/87 live inside the extension values. A single extension OID
+// therefore covers all three parameter sets, and the verifier learns the level from the
+// AlgorithmIdentifier.
 
 import (
 	"crypto"
@@ -42,9 +45,25 @@ const (
 	AlgoMLDSAHybrid = "mldsa-hybrid"
 )
 
-// OIDAltSubjectPublicKeyInfo is the X.509v3 extension carrying an alternative public key.
-// ITU-T X.509 (2019), clause 9.8.
-var OIDAltSubjectPublicKeyInfo = asn1.ObjectIdentifier{2, 5, 29, 72}
+// The three X.509v3 extensions of the alternative signature mechanism, ITU-T X.509 (2019)
+// clause 9.8. All of them are non-critical, which is what keeps a hybrid certificate valid for a
+// verifier that does not implement them.
+var (
+	// OIDAltSubjectPublicKeyInfo carries an alternative public key, as a SubjectPublicKeyInfo.
+	OIDAltSubjectPublicKeyInfo = asn1.ObjectIdentifier{2, 5, 29, 72}
+	// OIDAltSignatureAlgorithm carries the AlgorithmIdentifier of the alternative signature.
+	OIDAltSignatureAlgorithm = asn1.ObjectIdentifier{2, 5, 29, 73}
+	// OIDAltSignatureValue carries the alternative signature, as a BIT STRING.
+	OIDAltSignatureValue = asn1.ObjectIdentifier{2, 5, 29, 74}
+)
+
+// Signature and public key algorithm OIDs of ML-DSA, FIPS 204. The same OID identifies the key
+// and the signature, and the parameters field is always absent.
+var (
+	oidMLDSA44 = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 3, 17}
+	oidMLDSA65 = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 3, 18}
+	oidMLDSA87 = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 3, 19}
+)
 
 // IsMLDSAKeyRequest reports whether the key request asks for a pure ML-DSA certificate.
 func IsMLDSAKeyRequest(kr *csr.KeyRequest) bool {
@@ -185,6 +204,144 @@ func ParseAltPublicKeyExtension(exts []pkix.Extension) (pub *mldsa.PublicKey, sp
 	log.Debugf("ML-DSA: no %s extension present; treating as a non-hybrid certificate",
 		OIDAltSubjectPublicKeyInfo)
 	return nil, nil, false, nil
+}
+
+// MLDSAOIDForLevel returns the FIPS 204 algorithm OID of an ML-DSA security level.
+func MLDSAOIDForLevel(level int) (asn1.ObjectIdentifier, error) {
+	switch level {
+	case 44:
+		return oidMLDSA44, nil
+	case 65:
+		return oidMLDSA65, nil
+	case 87:
+		return oidMLDSA87, nil
+	default:
+		return nil, errors.Errorf("Invalid MLDSA key size: %d (expecting 44, 65 or 87)", level)
+	}
+}
+
+// MLDSALevelForOID is the inverse of MLDSAOIDForLevel.
+func MLDSALevelForOID(oid asn1.ObjectIdentifier) (int, error) {
+	switch {
+	case oid.Equal(oidMLDSA44):
+		return 44, nil
+	case oid.Equal(oidMLDSA65):
+		return 65, nil
+	case oid.Equal(oidMLDSA87):
+		return 87, nil
+	default:
+		return 0, errors.Errorf("Unrecognized ML-DSA algorithm OID '%s'", oid)
+	}
+}
+
+// MLDSAAlgorithmIdentifier returns the DER AlgorithmIdentifier of an ML-DSA security level, the
+// same encoding crypto/x509 puts in the signatureAlgorithm field. The parameters field is absent,
+// not NULL: encoding it as NULL yields bytes a strict verifier rejects.
+func MLDSAAlgorithmIdentifier(level int) ([]byte, error) {
+	oid, err := MLDSAOIDForLevel(level)
+	if err != nil {
+		return nil, err
+	}
+	der, err := asn1.Marshal(pkix.AlgorithmIdentifier{Algorithm: oid})
+	if err != nil {
+		return nil, errors.WithMessage(err, "Failed to encode the ML-DSA algorithm identifier")
+	}
+	return der, nil
+}
+
+// MarshalAltSignatureAlgorithmExtension encodes the altSignatureAlgorithm extension announcing
+// which ML-DSA level signed the PreTBSCertificate.
+func MarshalAltSignatureAlgorithmExtension(level int) (pkix.Extension, error) {
+	der, err := MLDSAAlgorithmIdentifier(level)
+	if err != nil {
+		return pkix.Extension{}, err
+	}
+	log.Debugf("ML-DSA: emitting extension %s announcing ML-DSA-%d", OIDAltSignatureAlgorithm, level)
+	return pkix.Extension{
+		Id:       OIDAltSignatureAlgorithm,
+		Critical: false,
+		Value:    der,
+	}, nil
+}
+
+// ParseAltSignatureAlgorithmExtension returns the ML-DSA level announced by the
+// altSignatureAlgorithm extension. found is false, with no error, when the extension is absent.
+func ParseAltSignatureAlgorithmExtension(exts []pkix.Extension) (level int, found bool, err error) {
+	ext, found := findExtension(exts, OIDAltSignatureAlgorithm)
+	if !found {
+		return 0, false, nil
+	}
+	var algorithm pkix.AlgorithmIdentifier
+	rest, err := asn1.Unmarshal(ext.Value, &algorithm)
+	if err != nil {
+		return 0, true, errors.WithMessage(err, "Failed to decode the alternative signature algorithm")
+	}
+	if len(rest) != 0 {
+		return 0, true, errors.New("Trailing data after the alternative signature algorithm")
+	}
+	level, err = MLDSALevelForOID(algorithm.Algorithm)
+	if err != nil {
+		return 0, true, err
+	}
+	log.Debugf("ML-DSA: found extension %s announcing ML-DSA-%d", OIDAltSignatureAlgorithm, level)
+	return level, true, nil
+}
+
+// MarshalAltSignatureValueExtension encodes the altSignatureValue extension carrying the
+// signature computed over the PreTBSCertificate.
+//
+// Adding this extension turns the PreTBSCertificate into the tbsCertificate, so it must be the
+// last change before the conventional signature is computed.
+func MarshalAltSignatureValueExtension(signature []byte) (pkix.Extension, error) {
+	if len(signature) == 0 {
+		return pkix.Extension{}, errors.New("Alternative signature is empty")
+	}
+	der, err := asn1.Marshal(asn1.BitString{Bytes: signature, BitLength: len(signature) * 8})
+	if err != nil {
+		return pkix.Extension{}, errors.WithMessage(err, "Failed to encode the alternative signature")
+	}
+	log.Debugf("ML-DSA: emitting extension %s with %d bytes of signature",
+		OIDAltSignatureValue, len(signature))
+	return pkix.Extension{
+		Id:       OIDAltSignatureValue,
+		Critical: false,
+		Value:    der,
+	}, nil
+}
+
+// ParseAltSignatureValueExtension returns the signature carried by the altSignatureValue
+// extension. found is false, with no error, when the extension is absent.
+func ParseAltSignatureValueExtension(exts []pkix.Extension) (signature []byte, found bool, err error) {
+	ext, found := findExtension(exts, OIDAltSignatureValue)
+	if !found {
+		return nil, false, nil
+	}
+	var bits asn1.BitString
+	rest, err := asn1.Unmarshal(ext.Value, &bits)
+	if err != nil {
+		return nil, true, errors.WithMessage(err, "Failed to decode the alternative signature")
+	}
+	if len(rest) != 0 {
+		return nil, true, errors.New("Trailing data after the alternative signature")
+	}
+	if bits.BitLength != len(bits.Bytes)*8 {
+		return nil, true, errors.Errorf("Alternative signature is not a whole number of bytes: %d bits", bits.BitLength)
+	}
+	if len(bits.Bytes) == 0 {
+		return nil, true, errors.New("Alternative signature is empty")
+	}
+	log.Debugf("ML-DSA: found extension %s with %d bytes of signature",
+		OIDAltSignatureValue, len(bits.Bytes))
+	return bits.Bytes, true, nil
+}
+
+func findExtension(exts []pkix.Extension, oid asn1.ObjectIdentifier) (pkix.Extension, bool) {
+	for _, ext := range exts {
+		if ext.Id.Equal(oid) {
+			return ext, true
+		}
+	}
+	return pkix.Extension{}, false
 }
 
 // GetAltPublicKeyFromCert is a convenience wrapper returning the ML-DSA public key carried by a

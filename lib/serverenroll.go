@@ -158,6 +158,12 @@ func handleEnroll(ctx *serverRequestContextImpl, id string) (interface{}, error)
 	if err != nil {
 		return nil, errors.WithMessage(err, "Certificate signing failure")
 	}
+	// A hybrid CA also signs the certificate with its ML-DSA key, in parallel with the
+	// conventional signature. This is a no-op for a CA without an alternative key.
+	cert, err = ca.addAlternativeSignature(cert)
+	if err != nil {
+		return nil, errors.WithMessage(err, "Alternative signature failure")
+	}
 	// Add server info to the response
 	resp := &api.EnrollmentResponseNet{
 		Cert: util.B64Encode(cert),

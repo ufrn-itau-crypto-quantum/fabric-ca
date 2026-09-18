@@ -7,6 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 package util
 
 import (
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/mldsa"
@@ -15,7 +16,9 @@ import (
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/pem"
+	"math/big"
 	"testing"
+	"time"
 
 	"github.com/cloudflare/cfssl/csr"
 	"github.com/hyperledger/fabric-lib-go/bccsp"
@@ -341,4 +344,156 @@ func newTestCSP(t *testing.T) bccsp.BCCSP {
 	csp, err := InitBCCSP(&opts, "msp", homeDir)
 	require.NoError(t, err, "failed initializing BCCSP")
 	return csp
+}
+
+// TestMLDSAAlgorithmIdentifierMatchesStdlib pins the encoding against the one crypto/x509 puts
+// in a certificate's signatureAlgorithm. The alternative signature is verified by rebuilding the
+// PreTBSCertificate, so an identifier that differs from the reference encoding -- parameters
+// encoded as NULL instead of absent, for instance -- breaks interoperability without any error
+// pointing at the cause.
+func TestMLDSAAlgorithmIdentifierMatchesStdlib(t *testing.T) {
+	for level, params := range map[int]mldsa.Parameters{
+		44: mldsa.MLDSA44(), 65: mldsa.MLDSA65(), 87: mldsa.MLDSA87(),
+	} {
+		key, err := mldsa.GenerateKey(params)
+		require.NoError(t, err)
+		cert := selfSignedMLDSACert(t, key)
+
+		got, err := MLDSAAlgorithmIdentifier(level)
+		require.NoError(t, err)
+		assert.Equal(t, cert.RawSignatureAlgorithm, got, "ML-DSA-%d", level)
+	}
+
+	_, err := MLDSAAlgorithmIdentifier(12)
+	assert.Error(t, err)
+}
+
+func TestMLDSAOIDForLevelRoundTrip(t *testing.T) {
+	for _, level := range []int{44, 65, 87} {
+		oid, err := MLDSAOIDForLevel(level)
+		require.NoError(t, err)
+		got, err := MLDSALevelForOID(oid)
+		require.NoError(t, err)
+		assert.Equal(t, level, got)
+	}
+
+	_, err := MLDSAOIDForLevel(88)
+	assert.Error(t, err)
+	_, err = MLDSALevelForOID(asn1.ObjectIdentifier{1, 2, 3})
+	assert.Error(t, err)
+}
+
+func TestAltSignatureAlgorithmExtensionRoundTrip(t *testing.T) {
+	for _, level := range []int{44, 65, 87} {
+		ext, err := MarshalAltSignatureAlgorithmExtension(level)
+		require.NoError(t, err)
+		assert.Equal(t, OIDAltSignatureAlgorithm, ext.Id)
+		assert.False(t, ext.Critical, "a critical extension would break a legacy verifier")
+
+		got, found, err := ParseAltSignatureAlgorithmExtension([]pkix.Extension{ext})
+		require.NoError(t, err)
+		assert.True(t, found)
+		assert.Equal(t, level, got)
+	}
+
+	_, err := MarshalAltSignatureAlgorithmExtension(12)
+	assert.Error(t, err)
+}
+
+func TestAltSignatureValueExtensionRoundTrip(t *testing.T) {
+	signature := make([]byte, 2420)
+	_, err := rand.Read(signature)
+	require.NoError(t, err)
+
+	ext, err := MarshalAltSignatureValueExtension(signature)
+	require.NoError(t, err)
+	assert.Equal(t, OIDAltSignatureValue, ext.Id)
+	assert.False(t, ext.Critical)
+
+	got, found, err := ParseAltSignatureValueExtension([]pkix.Extension{ext})
+	require.NoError(t, err)
+	assert.True(t, found)
+	assert.Equal(t, signature, got)
+
+	_, err = MarshalAltSignatureValueExtension(nil)
+	assert.Error(t, err)
+}
+
+// TestAltSignatureExtensionsSurviveACertificate checks the extensions through the encoding that
+// actually matters: written into a certificate by crypto/x509 and read back from the parsed one.
+func TestAltSignatureExtensionsSurviveACertificate(t *testing.T) {
+	key, err := mldsa.GenerateKey(mldsa.MLDSA65())
+	require.NoError(t, err)
+	signature, err := key.Sign(rand.Reader, []byte("pre-tbs"), crypto.Hash(0))
+	require.NoError(t, err)
+
+	algorithmExt, err := MarshalAltSignatureAlgorithmExtension(65)
+	require.NoError(t, err)
+	valueExt, err := MarshalAltSignatureValueExtension(signature)
+	require.NoError(t, err)
+
+	cert := selfSignedMLDSACert(t, key, algorithmExt, valueExt)
+
+	level, found, err := ParseAltSignatureAlgorithmExtension(cert.Extensions)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, 65, level)
+
+	got, found, err := ParseAltSignatureValueExtension(cert.Extensions)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, signature, got)
+	assert.NoError(t, mldsa.Verify(key.Public().(*mldsa.PublicKey), []byte("pre-tbs"), got, nil))
+}
+
+func TestParseAltSignatureExtensionsAbsentAndMalformed(t *testing.T) {
+	_, found, err := ParseAltSignatureAlgorithmExtension(nil)
+	assert.NoError(t, err)
+	assert.False(t, found)
+	_, found, err = ParseAltSignatureValueExtension(nil)
+	assert.NoError(t, err)
+	assert.False(t, found)
+
+	unknown, err := asn1.Marshal(pkix.AlgorithmIdentifier{Algorithm: asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 11}})
+	require.NoError(t, err)
+	for name, ext := range map[string]pkix.Extension{
+		"nao e um AlgorithmIdentifier": {Id: OIDAltSignatureAlgorithm, Value: []byte{0x02, 0x01, 0x00}},
+		"algoritmo desconhecido":       {Id: OIDAltSignatureAlgorithm, Value: unknown},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, found, err := ParseAltSignatureAlgorithmExtension([]pkix.Extension{ext})
+			assert.True(t, found, "a extensao esta presente, ainda que invalida")
+			assert.Error(t, err)
+		})
+	}
+
+	for name, ext := range map[string]pkix.Extension{
+		"nao e um BIT STRING": {Id: OIDAltSignatureValue, Value: []byte{0x02, 0x01, 0x00}},
+		"BIT STRING vazio":    {Id: OIDAltSignatureValue, Value: []byte{0x03, 0x01, 0x00}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, found, err := ParseAltSignatureValueExtension([]pkix.Extension{ext})
+			assert.True(t, found)
+			assert.Error(t, err)
+		})
+	}
+}
+
+func selfSignedMLDSACert(t *testing.T, key *mldsa.PrivateKey, extra ...pkix.Extension) *x509.Certificate {
+	t.Helper()
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(7),
+		Subject:               pkix.Name{CommonName: "alt-signature-test"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		ExtraExtensions:       extra,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, key.Public(), key)
+	require.NoError(t, err)
+	cert, err := x509.ParseCertificate(der)
+	require.NoError(t, err)
+	return cert
 }
