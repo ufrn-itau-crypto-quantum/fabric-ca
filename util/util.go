@@ -9,6 +9,7 @@ package util
 import (
 	"bytes"
 	"crypto/ecdsa"
+	"crypto/mldsa"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/base64"
@@ -158,16 +159,42 @@ func CreateToken(csp bccsp.BCCSP, cert []byte, key bccsp.Key, method, uri string
 			}
 	*/
 	case *ecdsa.PublicKey:
+		log.Debugf("CreateToken: signing %s %s with the certificate's ECDSA key", method, uri)
 		token, err = GenECDSAToken(csp, cert, key, method, uri, body)
 		if err != nil {
 			return "", err
 		}
+	case *mldsa.PublicKey:
+		log.Debugf("CreateToken: signing %s %s with the certificate's ML-DSA key", method, uri)
+		token, err = GenMLDSAToken(csp, cert, key, method, uri, body)
+		if err != nil {
+			return "", err
+		}
+	default:
+		return "", errors.Errorf("Unsupported public key type %T for token generation", publicKey)
 	}
 	return token, nil
 }
 
 // GenECDSAToken signs the http method, uri, body, and cert with ECDSA using EC private key
 func GenECDSAToken(csp bccsp.BCCSP, cert []byte, key bccsp.Key, method, uri string, body []byte) (string, error) {
+	return genToken(csp, cert, key, method, uri, body)
+}
+
+// GenMLDSAToken signs the http method, uri, body, and cert with the ML-DSA private key
+// matching a pure ML-DSA certificate.
+//
+// The payload and token layout must stay the ones GenECDSAToken produces: VerifyToken rebuilds
+// the same payload and hands its digest to csp.Verify. Signing anything else here would only
+// verify against a server patched to match.
+//
+// Hybrid certificates do not come through here; their SubjectPublicKeyInfo is classical, so
+// they take the ECDSA branch of CreateToken.
+func GenMLDSAToken(csp bccsp.BCCSP, cert []byte, key bccsp.Key, method, uri string, body []byte) (string, error) {
+	return genToken(csp, cert, key, method, uri, body)
+}
+
+func genToken(csp bccsp.BCCSP, cert []byte, key bccsp.Key, method, uri string, body []byte) (string, error) {
 	b64body := B64Encode(body)
 	b64cert := B64Encode(cert)
 	b64uri := B64Encode([]byte(uri))
@@ -273,6 +300,24 @@ func decodeToken(token string) (*x509.Certificate, string, string, error) {
 		return nil, "", "", errors.WithMessage(err, "Error in parsing x509 certificate given block bytes")
 	}
 	return x509Cert, b64cert, parts[1], nil
+}
+
+// GetMLDSAPrivateKey gets an *mldsa.PrivateKey from a PEM-encoded key. crypto/mldsa keys are
+// always PKCS#8; the parameter set comes from the algorithm OID inside the encoding.
+func GetMLDSAPrivateKey(raw []byte) (*mldsa.PrivateKey, error) {
+	decoded, _ := pem.Decode(raw)
+	if decoded == nil {
+		return nil, errors.New("Failed to decode the PEM-encoded ML-DSA key")
+	}
+	key, err := x509.ParsePKCS8PrivateKey(decoded.Bytes)
+	if err != nil {
+		return nil, errors.Wrap(err, "Failed parsing ML-DSA private key")
+	}
+	mldsaKey, ok := key.(*mldsa.PrivateKey)
+	if !ok {
+		return nil, errors.Errorf("Expecting ML-DSA private key but found %T", key)
+	}
+	return mldsaKey, nil
 }
 
 // GetECPrivateKey get *ecdsa.PrivateKey from key pem

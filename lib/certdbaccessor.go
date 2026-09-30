@@ -7,6 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 package lib
 
 import (
+	"encoding/hex"
 	"fmt"
 	"math/big"
 	"strings"
@@ -37,6 +38,11 @@ WHERE (id = ?);`
 	selectSQL = `
 SELECT %s FROM certificates
 WHERE (serial_number = ? AND authority_key_identifier = ?);`
+
+	updatePEMSQL = `
+UPDATE certificates
+SET pem = :pem
+WHERE (serial_number = :serial_number AND authority_key_identifier = :authority_key_identifier);`
 
 	updateRevokeSQL = `
 UPDATE certificates
@@ -126,6 +132,43 @@ func (d *CertDBAccessor) InsertCertificate(cr certdb.CertificateRecord) error {
 	}
 
 	return err
+}
+
+// UpdateCertificatePEM replaces the stored PEM of a certificate, looked up by the serial number
+// and authority key identifier of the given PEM.
+//
+// It exists for the hybrid issuance path, which rewrites a certificate after cfssl has already
+// inserted the record. The serial number and the authority key identifier do not change in that
+// rewrite, so they still identify the row.
+func (d *CertDBAccessor) UpdateCertificatePEM(certPEM []byte) error {
+	log.Debug("DB: Update certificate PEM")
+
+	err := d.checkDB()
+	if err != nil {
+		return err
+	}
+	cert, err := util.GetX509CertificateFromPEM(certPEM)
+	if err != nil {
+		return err
+	}
+
+	res, err := d.db.NamedExec("UpdateCertificatePEM", updatePEMSQL, map[string]interface{}{
+		"pem":                      string(certPEM),
+		"serial_number":            util.GetSerialAsHex(cert.SerialNumber),
+		"authority_key_identifier": strings.TrimLeft(hex.EncodeToString(cert.AuthorityKeyId), "0"),
+	})
+	if err != nil {
+		return errors.Wrap(err, "Failed to update the certificate record")
+	}
+	numRowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return errors.Wrap(err, "Failed to read the number of updated certificate records")
+	}
+	if numRowsAffected != 1 {
+		return errors.Errorf("Expected to update 1 entry in the certificate database but updated %d",
+			numRowsAffected)
+	}
+	return nil
 }
 
 // GetCertificatesByID gets a CertificateRecord indexed by id.
@@ -223,6 +266,25 @@ func (d *CertDBAccessor) GetRevokedAndUnexpiredCertificates() ([]certdb.Certific
 // GetRevokedAndUnexpiredCertificatesByLabel returns revoked and unexpired certificates matching the label
 func (d *CertDBAccessor) GetRevokedAndUnexpiredCertificatesByLabel(label string) ([]certdb.CertificateRecord, error) {
 	crs, err := d.accessor.GetRevokedAndUnexpiredCertificatesByLabel(label)
+	if err != nil {
+		return nil, err
+	}
+	return crs, err
+}
+
+// GetUnexpiredCertificatesByLabel returns unexpired certificates matching the labels
+func (d *CertDBAccessor) GetUnexpiredCertificatesByLabel(labels []string) ([]certdb.CertificateRecord, error) {
+	crs, err := d.accessor.GetUnexpiredCertificatesByLabel(labels)
+	if err != nil {
+		return nil, err
+	}
+	return crs, err
+}
+
+// GetRevokedAndUnexpiredCertificatesByLabelSelectColumns returns revoked and unexpired
+// certificates matching the label, selecting only a subset of the columns.
+func (d *CertDBAccessor) GetRevokedAndUnexpiredCertificatesByLabelSelectColumns(label string) ([]certdb.CertificateRecord, error) {
+	crs, err := d.accessor.GetRevokedAndUnexpiredCertificatesByLabelSelectColumns(label)
 	if err != nil {
 		return nil, err
 	}

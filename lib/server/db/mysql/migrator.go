@@ -112,6 +112,21 @@ func (m *Migrator) MigrateCertificatesTable() error {
 		if err != nil {
 			return err
 		}
+		// Columns the cfssl certdb accessor selects and inserts.
+		for _, column := range []string{
+			"issued_at timestamp NULL DEFAULT NULL",
+			"not_before timestamp NULL DEFAULT NULL",
+			"metadata TEXT",
+			"sans TEXT",
+			"common_name TEXT",
+		} {
+			_, err := tx.Exec(funcName, "ALTER TABLE certificates ADD COLUMN "+column)
+			if err != nil {
+				if !strings.Contains(err.Error(), "1060") { // Duplicate column name
+					return err
+				}
+			}
+		}
 		fallthrough
 
 	default:

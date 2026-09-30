@@ -130,6 +130,23 @@ func (m *Migrator) MigrateCertificatesTable() error {
 		}
 		fallthrough
 
+	case 1:
+		log.Debug("Upgrade certificates table to level 2")
+		// Columns the cfssl certdb accessor selects and inserts.
+		for _, column := range []string{
+			"issued_at timestamp",
+			"not_before timestamp",
+			"metadata TEXT",
+			"sans TEXT",
+			"common_name TEXT",
+		} {
+			_, err := tx.Exec(funcName, "ALTER TABLE certificates ADD COLUMN IF NOT EXISTS "+column)
+			if err != nil && !strings.Contains(err.Error(), "already exists") {
+				return err
+			}
+		}
+		fallthrough
+
 	default:
 		_, err := tx.Exec(funcName, tx.Rebind("UPDATE properties SET value = ? WHERE (property = 'certificate.level')"), m.SrvLevels.Certificate)
 		if err != nil {

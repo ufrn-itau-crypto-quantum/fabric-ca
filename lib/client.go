@@ -9,6 +9,7 @@ package lib
 import (
 	"bytes"
 	"crypto"
+	gox509 "crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -235,12 +236,19 @@ func (c *Client) GenCSR(req *api.CSRInfo, id string) ([]byte, bccsp.Key, error) 
 
 	cr := c.newCertificateRequest(req, id)
 
-	cspSigner, key, err := c.generateCSPSigner(cr, nil)
+	cspSigner, key, pqcKey, err := c.generateCSPSigner(cr, nil)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	csrPEM, err := csr.Generate(cspSigner, cr)
+	// For a hybrid request, carry the ML-DSA public key in the CSR so the CA can copy it into
+	// the issued certificate. The server re-injects it through SignRequest.Extensions, since
+	// cfssl drops CSR extensions unless the profile enables copy_extensions.
+	if err := addAltPublicKeyToCSR(cr, pqcKey); err != nil {
+		return nil, nil, err
+	}
+
+	csrPEM, err := util.GenerateCSR(cspSigner, cr)
 	if err != nil {
 		log.Debugf("failed generating CSR: %s", err)
 		return nil, nil, err
@@ -252,6 +260,17 @@ func (c *Client) GenCSR(req *api.CSRInfo, id string) ([]byte, bccsp.Key, error) 
 // GenCSRUsingKey generates a CSR (Certificate Signing Request) using the
 // supplied private key.
 func (c *Client) GenCSRUsingKey(req *api.CSRInfo, id string, k bccsp.Key) ([]byte, bccsp.Key, error) {
+	return c.GenCSRUsingKeyAndCert(req, id, k, nil)
+}
+
+// GenCSRUsingKeyAndCert generates a CSR (Certificate Signing Request) using the supplied
+// private key.
+//
+// prevCert, when not nil, is the certificate the key was issued under. It is used to recover
+// the ML-DSA public key of a hybrid identity, which is not reachable from the classical key
+// alone, so that a reenrollment with a reused key does not silently drop the alternative
+// public key extension.
+func (c *Client) GenCSRUsingKeyAndCert(req *api.CSRInfo, id string, k bccsp.Key, prevCert *gox509.Certificate) ([]byte, bccsp.Key, error) {
 	log.Debugf("GenCSRUsingKey %+v", req)
 
 	err := c.Init()
@@ -261,12 +280,23 @@ func (c *Client) GenCSRUsingKey(req *api.CSRInfo, id string, k bccsp.Key) ([]byt
 
 	cr := c.newCertificateRequest(req, id)
 
-	cspSigner, key, err := c.generateCSPSigner(cr, k)
+	cspSigner, key, pqcKey, err := c.generateCSPSigner(cr, k)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	csrPEM, err := csr.Generate(cspSigner, cr)
+	if pqcKey == nil && prevCert != nil {
+		pqcKey, err = util.GetAltPublicKeyBCCSPFromCert(prevCert, c.csp)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+
+	if err := addAltPublicKeyToCSR(cr, pqcKey); err != nil {
+		return nil, nil, err
+	}
+
+	csrPEM, err := util.GenerateCSR(cspSigner, cr)
 	if err != nil {
 		log.Debugf("failed generating CSR: %s", err)
 		return nil, nil, err
@@ -275,27 +305,49 @@ func (c *Client) GenCSRUsingKey(req *api.CSRInfo, id string, k bccsp.Key) ([]byt
 	return csrPEM, key, nil
 }
 
+// addAltPublicKeyToCSR attaches the altSubjectPublicKeyInfo extension to a certificate request.
+// It is a no-op when there is no ML-DSA key, i.e. for a classical or a pure ML-DSA request.
+func addAltPublicKeyToCSR(cr *csr.CertificateRequest, pqcKey bccsp.Key) error {
+	if pqcKey == nil {
+		return nil
+	}
+	pqcPub, err := pqcKey.PublicKey()
+	if err != nil {
+		return errors.WithMessage(err, "Failed to get ML-DSA public key")
+	}
+	ext, err := util.MarshalAltPublicKeyExtension(pqcPub)
+	if err != nil {
+		return err
+	}
+	cr.Extensions = append(cr.Extensions, ext)
+	return nil
+}
+
 // generateCSPSigner generates a crypto.Signer for a given certificate request.
 // If a key is not provided, a new one will be generated.
-func (c *Client) generateCSPSigner(cr *csr.CertificateRequest, key bccsp.Key) (crypto.Signer, bccsp.Key, error) {
+//
+// The returned bccsp.Key is the one matching the certificate's SubjectPublicKeyInfo, so it is
+// the key the identity is stored under. For a hybrid request an ML-DSA key is generated as
+// well and returned separately; it is nil otherwise.
+func (c *Client) generateCSPSigner(cr *csr.CertificateRequest, key bccsp.Key) (crypto.Signer, bccsp.Key, bccsp.Key, error) {
 	if key == nil {
 		// generate new key
-		key, cspSigner, err := util.BCCSPKeyRequestGenerate(cr, c.csp)
+		key, pqcKey, cspSigner, err := util.BCCSPKeyRequestGenerateHybrid(cr, c.csp)
 		if err != nil {
 			log.Debugf("failed generating BCCSP key: %s", err)
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
-		return cspSigner, key, nil
+		return cspSigner, key, pqcKey, nil
 	}
 
 	// use existing key
 	log.Debugf("generating signer with existing key: %s", hex.EncodeToString(key.SKI()))
 	cspSigner, err := cspsigner.New(c.csp, key)
 	if err != nil {
-		return nil, nil, errors.WithMessage(err, "Failed initializing CryptoSigner")
+		return nil, nil, nil, errors.WithMessage(err, "Failed initializing CryptoSigner")
 	}
 
-	return cspSigner, key, nil
+	return cspSigner, key, nil, nil
 }
 
 // Enroll enrolls a new identity

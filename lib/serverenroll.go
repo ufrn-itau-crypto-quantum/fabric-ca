@@ -9,6 +9,7 @@ package lib
 import (
 	"crypto/x509"
 	"encoding/asn1"
+	"encoding/hex"
 	"encoding/pem"
 	"time"
 
@@ -157,6 +158,12 @@ func handleEnroll(ctx *serverRequestContextImpl, id string) (interface{}, error)
 	if err != nil {
 		return nil, errors.WithMessage(err, "Certificate signing failure")
 	}
+	// A hybrid CA also signs the certificate with its ML-DSA key, in parallel with the
+	// conventional signature. This is a no-op for a CA without an alternative key.
+	cert, err = ca.addAlternativeSignature(cert)
+	if err != nil {
+		return nil, errors.WithMessage(err, "Alternative signature failure")
+	}
 	// Add server info to the response
 	resp := &api.EnrollmentResponseNet{
 		Cert: util.B64Encode(cert),
@@ -212,6 +219,13 @@ func processSignRequest(id string, req *signer.SignRequest, ca *CA, ctx *serverR
 	if err != nil {
 		return caerrors.NewHTTPErr(400, caerrors.ErrInputValidCSR, "CSR input validation failed: %s", err)
 	}
+	// If the CSR carries an alternative (ML-DSA) public key, propagate it to the sign request.
+	// cfssl drops CSR extensions unless the profile sets copy_extensions, so it has to travel
+	// through SignRequest.Extensions, where the profile's ExtensionWhitelist authorizes it.
+	err = propagateAltPublicKey(req, csrReq)
+	if err != nil {
+		return caerrors.NewHTTPErr(400, caerrors.ErrInputValidCSR, "CSR input validation failed: %s", err)
+	}
 	caller, err := ctx.GetCaller()
 	if err != nil {
 		return err
@@ -219,6 +233,37 @@ func processSignRequest(id string, req *signer.SignRequest, ca *CA, ctx *serverR
 	// Set the OUs in the request appropriately.
 	setRequestOUs(req, caller)
 	log.Debug("Finished processing sign request")
+	return nil
+}
+
+// propagateAltPublicKey copies the altSubjectPublicKeyInfo extension from the CSR into the
+// sign request, so that the issued certificate carries the requester's ML-DSA public key.
+// It is a no-op when the CSR has no such extension.
+func propagateAltPublicKey(req *signer.SignRequest, csrReq *x509.CertificateRequest) error {
+	pub, spki, found, err := util.ParseAltPublicKeyExtension(csrReq.Extensions)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return nil
+	}
+	// Re-encode rather than forwarding the CSR bytes verbatim, so a malformed or oversized
+	// value is rejected here instead of ending up in a certificate.
+	ext, err := util.MarshalAltPublicKeyExtensionFromSPKI(spki)
+	if err != nil {
+		return err
+	}
+	level, err := util.MLDSALevelForKey(pub)
+	if err != nil {
+		return err
+	}
+	log.Debugf("Adding ML-DSA-%d alternative public key extension to CSR", level)
+	req.Extensions = append(req.Extensions, signer.Extension{
+		ID:       config.OID(ext.Id),
+		Critical: ext.Critical,
+		// cfssl hex-decodes this value before building the pkix.Extension.
+		Value: hex.EncodeToString(ext.Value),
+	})
 	return nil
 }
 

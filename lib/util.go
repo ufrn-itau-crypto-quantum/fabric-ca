@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/cloudflare/cfssl/log"
 	"github.com/grantae/certinfo"
@@ -22,6 +23,7 @@ import (
 	"github.com/hyperledger/fabric-ca/lib/caerrors"
 	"github.com/pkg/errors"
 	"github.com/spf13/viper"
+	"go.yaml.in/yaml/v4"
 )
 
 var clientAuthTypes = map[string]tls.ClientAuthType{
@@ -86,6 +88,58 @@ func UnmarshalConfig(config interface{}, vp *viper.Viper, configFile string,
 		err = vp.Unmarshal(&serverCfg.CAcfg)
 		if err != nil {
 			return errors.Wrapf(err, "Incorrect format in file '%s'", configFile)
+		}
+		return restoreIdentityAttrCase(serverCfg.CAcfg.Registry.Identities, configFile)
+	}
+	if caCfg, ok := config.(*CAConfig); ok {
+		return restoreIdentityAttrCase(caCfg.Registry.Identities, configFile)
+	}
+	return nil
+}
+
+// restoreIdentityAttrCase puts back the original spelling of the registry attribute names by
+// reading them from the YAML, which preserves case, keyed by the lowercased name.
+//
+// Viper lowercases every key it unmarshals, including the keys of registry.identities[].attrs.
+// Attribute names are data, not configuration schema, and Fabric matches them literally:
+// "hf.Registrar.Roles" arriving lowercased makes GetAttribute miss and the bootstrap admin
+// stops being a registrar, while enroll keeps working because it is password-based.
+func restoreIdentityAttrCase(identities []CAConfigIdentity, configFile string) error {
+	if len(identities) == 0 {
+		return nil
+	}
+
+	data, err := os.ReadFile(configFile)
+	if err != nil {
+		return errors.Wrapf(err, "Failed to read config file '%s'", configFile)
+	}
+
+	var raw struct {
+		Registry struct {
+			Identities []struct {
+				Attrs map[string]string `yaml:"attrs"`
+			} `yaml:"identities"`
+		} `yaml:"registry"`
+	}
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return errors.Wrapf(err, "Incorrect format in file '%s'", configFile)
+	}
+
+	original := map[string]string{}
+	for _, identity := range raw.Registry.Identities {
+		for name := range identity.Attrs {
+			original[strings.ToLower(name)] = name
+		}
+	}
+
+	for _, identity := range identities {
+		for name, value := range identity.Attrs {
+			cased, ok := original[name]
+			if !ok || cased == name {
+				continue
+			}
+			delete(identity.Attrs, name)
+			identity.Attrs[cased] = value
 		}
 	}
 	return nil
