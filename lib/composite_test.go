@@ -12,6 +12,7 @@ import (
 	"crypto/x509"
 	"encoding/asn1"
 	"encoding/hex"
+	"encoding/pem"
 	"fmt"
 	"os"
 	"path"
@@ -219,6 +220,23 @@ func TestCompositeEnrollment(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, delivered[stored.SerialNumber.String()], stored.Raw)
 	}
+
+	_, err = resp.Identity.Revoke(&api.RevocationRequest{
+		Serial: util.GetSerialAsHex(classic.SerialNumber),
+		AKI:    hex.EncodeToString(classic.AuthorityKeyId),
+	})
+	require.NoError(t, err)
+	crlResp, err := resp.Identity.GenCRL(&api.GenCRLRequest{})
+	require.NoError(t, err)
+	block, _ := pem.Decode(crlResp.CRL)
+	require.NotNil(t, block)
+	//nolint:staticcheck
+	crl, err := x509.ParseCRL(block.Bytes)
+	require.NoError(t, err)
+	require.True(t, composite.IsCRLSignedWithComposite(crl))
+	require.NoError(t, composite.CheckCRLSignature(crl, caPub))
+	require.Len(t, crl.TBSCertList.RevokedCertificates, 1)
+	require.Equal(t, classic.SerialNumber, crl.TBSCertList.RevokedCertificates[0].SerialNumber)
 }
 
 func TestCompositeKeyRequestRejectsInvalidSize(t *testing.T) {

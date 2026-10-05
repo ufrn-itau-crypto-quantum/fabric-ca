@@ -7,11 +7,15 @@ SPDX-License-Identifier: Apache-2.0
 package lib
 
 import (
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
+	"crypto/x509/pkix"
+	"time"
 
+	"github.com/cloudflare/cfssl/crl"
 	"github.com/cloudflare/cfssl/signer"
 	cflocalsigner "github.com/cloudflare/cfssl/signer/local"
 	"github.com/hyperledger/fabric-ca/util"
@@ -72,4 +76,21 @@ func (ca *CA) signCompositeCertificate(req signer.SignRequest, caCert *x509.Cert
 		return nil, err
 	}
 	return cert, nil
+}
+
+// createCRL gera a CRL DER com o cfssl. Com uma chave composite, o cfssl assina com uma chave ECDSA
+// descartável, e a CRL é reescrita com a assinatura composite.
+func createCRL(revoked []pkix.RevokedCertificate, caSigner crypto.Signer, caCert *x509.Certificate, expiry time.Time) ([]byte, error) {
+	if _, ok := caSigner.Public().(*composite.PublicKey); !ok {
+		return crl.CreateGenericCRL(revoked, caSigner, caCert, expiry)
+	}
+	throwaway, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, errors.WithMessage(err, "Failed to generate the throwaway key for the draft CRL")
+	}
+	draft, err := crl.CreateGenericCRL(revoked, throwaway, caCert, expiry)
+	if err != nil {
+		return nil, err
+	}
+	return util.RewriteAsCompositeCRL(draft, caSigner)
 }

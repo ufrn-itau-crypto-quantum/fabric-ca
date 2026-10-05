@@ -302,6 +302,46 @@ func TestCompositeDraftRequest(t *testing.T) {
 	require.ErrorContains(t, err, "signature is not valid")
 }
 
+func TestCompositeRewriteCRL(t *testing.T) {
+	_, caCert := compositeDraft(t)
+	issuer := compositeTestKey(t, 65)
+	revoked := []pkix.RevokedCertificate{{SerialNumber: big.NewInt(42), RevocationTime: time.Now()}}
+	throwaway, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	//nolint:staticcheck
+	draft, err := caCert.CreateCRL(rand.Reader, throwaway, revoked, time.Now(), time.Now().Add(time.Hour))
+	require.NoError(t, err)
+
+	der, err := RewriteAsCompositeCRL(draft, issuer)
+	require.NoError(t, err)
+	//nolint:staticcheck
+	crl, err := x509.ParseCRL(der)
+	require.NoError(t, err)
+	//nolint:staticcheck
+	draftCRL, err := x509.ParseCRL(draft)
+	require.NoError(t, err)
+
+	// AlgorithmIdentifier copiado dos certificados x5c do apêndice E do draft 19, nos dois campos
+	for _, ai := range []pkix.AlgorithmIdentifier{crl.SignatureAlgorithm, crl.TBSCertList.Signature} {
+		raw, err := asn1.Marshal(ai)
+		require.NoError(t, err)
+		require.Equal(t, "300a06082b0601050507062e", hex.EncodeToString(raw))
+	}
+	require.NoError(t, composite.CheckCRLSignature(crl, issuer.PublicKey()))
+
+	require.Equal(t, draftCRL.TBSCertList.Version, crl.TBSCertList.Version)
+	require.Equal(t, draftCRL.TBSCertList.Issuer, crl.TBSCertList.Issuer)
+	require.Equal(t, draftCRL.TBSCertList.RevokedCertificates[0].SerialNumber, crl.TBSCertList.RevokedCertificates[0].SerialNumber)
+	require.Equal(t, draftCRL.TBSCertList.Extensions, crl.TBSCertList.Extensions)
+	require.Equal(t, draftCRL.TBSCertList.ThisUpdate, crl.TBSCertList.ThisUpdate)
+	require.Equal(t, draftCRL.TBSCertList.NextUpdate, crl.TBSCertList.NextUpdate)
+
+	_, err = RewriteAsCompositeCRL(draft, throwaway)
+	require.ErrorContains(t, err, "must have a Composite ML-DSA key")
+	_, err = RewriteAsCompositeCRL([]byte("not a crl"), issuer)
+	require.Error(t, err)
+}
+
 func TestCompositeRewriteKeepsClassicalSubject(t *testing.T) {
 	draftPEM, draft := compositeDraft(t)
 	issuer := compositeTestKey(t, 44)

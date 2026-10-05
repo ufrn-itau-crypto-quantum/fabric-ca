@@ -124,6 +124,65 @@ func RewriteAsCompositeCertificate(draftPEM []byte, subject *composite.PublicKey
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), nil
 }
 
+// RewriteAsCompositeCRL transforma a CRL DER que o cfssl gerou com uma chave descartável na CRL
+// composite. Troca o algoritmo de assinatura do TBSCertList e assina o TBSCertList inteiro com issuer.
+func RewriteAsCompositeCRL(draftDER []byte, issuer crypto.Signer) ([]byte, error) {
+	issuerPub, ok := issuer.Public().(*composite.PublicKey)
+	if !ok {
+		return nil, errors.Errorf("Composite CRL issuer must have a Composite ML-DSA key, got %T", issuer.Public())
+	}
+	var outer struct {
+		TBS                asn1.RawValue
+		SignatureAlgorithm asn1.RawValue
+		Signature          asn1.BitString
+	}
+	if _, err := asn1.Unmarshal(draftDER, &outer); err != nil {
+		return nil, errors.WithMessage(err, "Failed to parse the draft CRL")
+	}
+	var fields []asn1.RawValue
+	for rest := outer.TBS.Bytes; len(rest) > 0; {
+		var field asn1.RawValue
+		var err error
+		if rest, err = asn1.Unmarshal(rest, &field); err != nil {
+			return nil, errors.WithMessage(err, "Failed to parse the draft TBSCertList")
+		}
+		fields = append(fields, field)
+	}
+	// O version é opcional e vem antes do signature.
+	i := 0
+	if len(fields) > 0 && fields[0].Class == asn1.ClassUniversal && fields[0].Tag == asn1.TagInteger {
+		i = 1
+	}
+	if len(fields) <= i {
+		return nil, errors.New("The draft TBSCertList has no signature field")
+	}
+	algID, err := composite.AlgorithmIdentifier(issuerPub.Algorithm)
+	if err != nil {
+		return nil, err
+	}
+	var content []byte
+	for j, field := range fields {
+		if j == i {
+			content = append(content, algID...)
+			continue
+		}
+		content = append(content, field.FullBytes...)
+	}
+	tbs, err := asn1.Marshal(asn1.RawValue{Class: asn1.ClassUniversal, Tag: asn1.TagSequence, IsCompound: true, Bytes: content})
+	if err != nil {
+		return nil, err
+	}
+	// CRLs usam ctx vazio.
+	signature, err := issuer.Sign(rand.Reader, tbs, nil)
+	if err != nil {
+		return nil, errors.WithMessage(err, "Failed to sign the composite CRL")
+	}
+	outer.TBS = asn1.RawValue{FullBytes: tbs}
+	outer.SignatureAlgorithm = asn1.RawValue{FullBytes: algID}
+	outer.Signature = asn1.BitString{Bytes: signature, BitLength: 8 * len(signature)}
+	return asn1.Marshal(outer)
+}
+
 // GetCompositePrivateKey lê uma chave privada composite em PEM PKCS#8.
 func GetCompositePrivateKey(raw []byte) (*composite.PrivateKey, error) {
 	decoded, _ := pem.Decode(raw)

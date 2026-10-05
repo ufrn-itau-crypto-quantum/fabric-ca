@@ -79,6 +79,41 @@ func CheckCertificateSignature(cert *x509.Certificate, issuer *PublicKey) error 
 	return Verify(issuer, outer.TBS.FullBytes, outer.Signature.Bytes, nil)
 }
 
+// IsCRLSignedWithComposite informa se o campo signatureAlgorithm da CRL é um OID composite.
+func IsCRLSignedWithComposite(crl *pkix.CertificateList) bool {
+	if crl == nil {
+		return false
+	}
+	_, err := AlgorithmByOID(crl.SignatureAlgorithm.Algorithm)
+	return err == nil
+}
+
+// CheckCRLSignature confere a assinatura composite de uma CRL com a chave do emissor. Recusa a CRL
+// quando o algoritmo externo e o algoritmo do TBSCertList são diferentes ou têm o campo parameters.
+func CheckCRLSignature(crl *pkix.CertificateList, issuer *PublicKey) error {
+	if crl == nil || issuer == nil {
+		return errors.New("CRL and issuer public key are required")
+	}
+	algID, err := AlgorithmIdentifier(issuer.Algorithm)
+	if err != nil {
+		return err
+	}
+	for _, ai := range []pkix.AlgorithmIdentifier{crl.SignatureAlgorithm, crl.TBSCertList.Signature} {
+		der, err := asn1.Marshal(ai)
+		if err != nil {
+			return errors.WithMessage(err, "Failed to encode the CRL signature algorithm")
+		}
+		if !bytes.Equal(der, algID) {
+			return errors.Errorf("CRL signature algorithm is not the one of the issuer key %s", issuer.Algorithm.Label)
+		}
+	}
+	if crl.SignatureValue.BitLength != len(crl.SignatureValue.Bytes)*8 {
+		return errors.New("CRL signature is not a whole number of bytes")
+	}
+	// CRLs usam ctx vazio.
+	return Verify(issuer, crl.TBSCertList.Raw, crl.SignatureValue.Bytes, nil)
+}
+
 // IsSignedWithComposite informa se o campo signatureAlgorithm de cert é um OID composite.
 func IsSignedWithComposite(cert *x509.Certificate) bool {
 	if cert == nil {
