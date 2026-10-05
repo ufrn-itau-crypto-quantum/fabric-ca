@@ -11,7 +11,9 @@ import (
 	"crypto"
 	"crypto/dsa"
 	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/mldsa"
+	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -52,6 +54,7 @@ import (
 	"github.com/hyperledger/fabric-ca/lib/tls"
 	"github.com/hyperledger/fabric-ca/util"
 	"github.com/hyperledger/fabric-lib-go/bccsp"
+	"github.com/hyperledger/fabric-lib-go/bccsp/composite"
 	cspsigner "github.com/hyperledger/fabric-lib-go/bccsp/signer"
 	"github.com/pkg/errors"
 
@@ -376,7 +379,11 @@ func (ca *CA) getCACert() (cert []byte, err error) {
 			extensions = append(extensions, ext)
 		}
 
-		cert, err = newSelfSignedCACert(&req, cspSigner, extensions)
+		if util.IsCompositeKeyRequest(req.KeyRequest) {
+			cert, err = newSelfSignedCompositeCACert(&req, cspSigner)
+		} else {
+			cert, err = newSelfSignedCACert(&req, cspSigner, extensions)
+		}
 		if err != nil {
 			return nil, errors.WithMessage(err, "Failed to create new CA certificate")
 		}
@@ -454,6 +461,28 @@ func newSelfSignedCACert(req *cfcsr.CertificateRequest, priv crypto.Signer, exte
 		Request:    string(csrPEM),
 		Extensions: signerExts,
 	})
+}
+
+// newSelfSignedCompositeCACert emite com o cfssl um rascunho assinado por uma chave ECDSA descartável
+// e reescreve o rascunho com a chave composta.
+func newSelfSignedCompositeCACert(req *cfcsr.CertificateRequest, priv crypto.Signer) ([]byte, error) {
+	pub, ok := priv.Public().(*composite.PublicKey)
+	if !ok {
+		return nil, errors.Errorf("Composite CA key must be a Composite ML-DSA key, got %T", priv.Public())
+	}
+	throwaway, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, errors.WithMessage(err, "Failed to generate the throwaway key for the draft certificate")
+	}
+	draft, err := newSelfSignedCACert(req, throwaway, nil)
+	if err != nil {
+		return nil, err
+	}
+	skid, err := composite.SubjectKeyID(pub)
+	if err != nil {
+		return nil, err
+	}
+	return util.RewriteAsCompositeCertificate(draft, pub, priv, skid)
 }
 
 // Return a certificate chain which is the concatenation of chain and cert
@@ -1283,6 +1312,21 @@ func validateMatchingKeys(cert *x509.Certificate, keyFile string) error {
 	keyPEM, err := os.ReadFile(keyFile)
 	if err != nil {
 		return err
+	}
+
+	if composite.IsPKIXPublicKey(cert.RawSubjectPublicKeyInfo) {
+		pubKey, err := composite.ParsePKIXPublicKey(cert.RawSubjectPublicKeyInfo)
+		if err != nil {
+			return err
+		}
+		privKey, err := util.GetCompositePrivateKey(keyPEM)
+		if err != nil {
+			return err
+		}
+		if !privKey.PublicKey().Equal(pubKey) {
+			return errors.New("Public key and private key do not match")
+		}
+		return nil
 	}
 
 	pubKey := cert.PublicKey
