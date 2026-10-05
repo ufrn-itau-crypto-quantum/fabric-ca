@@ -902,7 +902,7 @@ func (s *Server) autoGenerateTLSCertificateKey() error {
 	}
 
 	// Use default CA to get back signed TLS certificate
-	cert, err := s.CA.enrollSigner.Sign(req)
+	cert, err := s.CA.signCertificate(req)
 	if err != nil {
 		return fmt.Errorf("Failed to generate TLS certificate: %s", err)
 	}

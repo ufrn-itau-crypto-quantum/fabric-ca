@@ -14,8 +14,11 @@ import (
 	"crypto/sha1"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
+	"encoding/hex"
 	"encoding/pem"
 	"math/big"
+	"net"
 	"testing"
 	"time"
 
@@ -136,4 +139,183 @@ func TestCompositeKeyRequest(t *testing.T) {
 	}
 	_, err := getBCCSPKeyOpts(&csr.KeyRequest{A: AlgoComposite, S: 256}, true)
 	require.Error(t, err)
+}
+
+var oidTestCSRExtension = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 99999, 1}
+
+func compositeTestCSRRequest() *csr.CertificateRequest {
+	return &csr.CertificateRequest{
+		CN:         "composite-csr",
+		Names:      []csr.Name{{O: "org1", OU: "peer"}},
+		Hosts:      []string{"peer0.org1.example.com", "10.0.0.1", "admin@org1.example.com", "spiffe://org1/peer0"},
+		Extensions: []pkix.Extension{{Id: oidTestCSRExtension, Value: []byte{0x05, 0x00}}},
+	}
+}
+
+func compositeTestCSR(t *testing.T, key *composite.PrivateKey) []byte {
+	t.Helper()
+	csrPEM, err := GenerateCSR(key, compositeTestCSRRequest())
+	require.NoError(t, err)
+	block, _ := pem.Decode(csrPEM)
+	require.NotNil(t, block)
+	require.Equal(t, "CERTIFICATE REQUEST", block.Type)
+	return block.Bytes
+}
+
+func TestCompositeCSR(t *testing.T) {
+	// AlgorithmIdentifier copiado dos certificados x5c do apêndice E do draft 19
+	for level, algID := range map[int]string{44: "300a06082b06010505070628", 65: "300a06082b0601050507062e", 87: "300a06082b06010505070631"} {
+		key := compositeTestKey(t, level)
+		der := compositeTestCSR(t, key)
+
+		req, pub, err := ParseCompositeCertificateRequest(der)
+		require.NoError(t, err)
+		require.True(t, pub.Equal(key.PublicKey()))
+
+		var outer certificationRequest
+		_, err = asn1.Unmarshal(der, &outer)
+		require.NoError(t, err)
+		require.Equal(t, algID, hex.EncodeToString(outer.SignatureAlgorithm.FullBytes))
+		var spki struct {
+			Algorithm asn1.RawValue
+			PublicKey asn1.BitString
+		}
+		_, err = asn1.Unmarshal(req.RawSubjectPublicKeyInfo, &spki)
+		require.NoError(t, err)
+		require.Equal(t, algID, hex.EncodeToString(spki.Algorithm.FullBytes))
+
+		require.Equal(t, "composite-csr", req.Subject.CommonName)
+		require.Equal(t, []string{"org1"}, req.Subject.Organization)
+		require.Equal(t, []string{"peer"}, req.Subject.OrganizationalUnit)
+		require.Equal(t, []string{"peer0.org1.example.com"}, req.DNSNames)
+		require.True(t, req.IPAddresses[0].Equal(net.ParseIP("10.0.0.1")))
+		require.Equal(t, []string{"admin@org1.example.com"}, req.EmailAddresses)
+		require.Equal(t, "spiffe://org1/peer0", req.URIs[0].String())
+		found := false
+		for _, ext := range req.Extensions {
+			found = found || ext.Id.Equal(oidTestCSRExtension)
+		}
+		require.True(t, found)
+
+		require.Nil(t, req.PublicKey)
+		require.Error(t, req.CheckSignature())
+	}
+}
+
+func TestCompositeCSRRejects(t *testing.T) {
+	key := compositeTestKey(t, 65)
+	der := compositeTestCSR(t, key)
+	req, err := x509.ParseCertificateRequest(der)
+	require.NoError(t, err)
+	var outer certificationRequest
+	_, err = asn1.Unmarshal(der, &outer)
+	require.NoError(t, err)
+
+	tampered := bytes.Clone(der)
+	i := bytes.Index(tampered, []byte("composite-csr"))
+	require.Positive(t, i)
+	tampered[i] = 'k'
+	_, _, err = ParseCompositeCertificateRequest(tampered)
+	require.ErrorContains(t, err, "signature is not valid")
+
+	other := compositeTestKey(t, 65)
+	otherSPKI, err := composite.MarshalPKIXPublicKey(other.PublicKey())
+	require.NoError(t, err)
+	info, err := replaceCSRPublicKey(req.RawTBSCertificateRequest, otherSPKI)
+	require.NoError(t, err)
+	swapped, err := assembleCSR(info, outer.SignatureAlgorithm.FullBytes, outer.Signature.Bytes)
+	require.NoError(t, err)
+	_, _, err = ParseCompositeCertificateRequest(swapped)
+	require.ErrorContains(t, err, "signature is not valid")
+
+	for _, algID := range []string{"300a06082b06010505070628", "300c06082b0601050507062e0500"} {
+		raw, err := hex.DecodeString(algID)
+		require.NoError(t, err)
+		wrongAlg, err := assembleCSR(req.RawTBSCertificateRequest, raw, outer.Signature.Bytes)
+		require.NoError(t, err)
+		_, _, err = ParseCompositeCertificateRequest(wrongAlg)
+		require.ErrorContains(t, err, "signature algorithm is different")
+	}
+
+	_, _, err = ParseCompositeCertificateRequest(append(bytes.Clone(der), 0))
+	require.Error(t, err)
+
+	ecKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	ecPEM, err := GenerateCSR(ecKey, compositeTestCSRRequest())
+	require.NoError(t, err)
+	block, _ := pem.Decode(ecPEM)
+	_, _, err = ParseCompositeCertificateRequest(block.Bytes)
+	require.ErrorIs(t, err, composite.ErrNotComposite)
+}
+
+func TestCompositeDraftRequest(t *testing.T) {
+	key := compositeTestKey(t, 87)
+	der := compositeTestCSR(t, key)
+	orig, err := x509.ParseCertificateRequest(der)
+	require.NoError(t, err)
+	throwaway, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	pub, draftPEM, err := CompositeDraftRequest(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der}), throwaway)
+	require.NoError(t, err)
+	require.True(t, pub.Equal(key.PublicKey()))
+	block, _ := pem.Decode(draftPEM)
+	require.NotNil(t, block)
+	draft, err := x509.ParseCertificateRequest(block.Bytes)
+	require.NoError(t, err)
+
+	require.NoError(t, draft.CheckSignature())
+	require.True(t, throwaway.PublicKey.Equal(draft.PublicKey))
+
+	restored, err := replaceCSRPublicKey(draft.RawTBSCertificateRequest, orig.RawSubjectPublicKeyInfo)
+	require.NoError(t, err)
+	require.Equal(t, orig.RawTBSCertificateRequest, restored)
+
+	ecKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	ecPEM, err := GenerateCSR(ecKey, compositeTestCSRRequest())
+	require.NoError(t, err)
+	pub, out, err := CompositeDraftRequest(ecPEM, throwaway)
+	require.NoError(t, err)
+	require.Nil(t, pub)
+	require.Equal(t, ecPEM, out)
+
+	var info certificationRequestInfo
+	_, err = asn1.Unmarshal(orig.RawTBSCertificateRequest, &info)
+	require.NoError(t, err)
+	info.Version = 1
+	infoV1, err := asn1.Marshal(info)
+	require.NoError(t, err)
+	sigV1, err := key.Sign(rand.Reader, infoV1, nil)
+	require.NoError(t, err)
+	algID, err := composite.AlgorithmIdentifier(key.PublicKey().Algorithm)
+	require.NoError(t, err)
+	v1, err := assembleCSR(infoV1, algID, sigV1)
+	require.NoError(t, err)
+	_, _, err = CompositeDraftRequest(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: v1}), throwaway)
+	require.ErrorContains(t, err, "Unsupported CSR version 1")
+
+	tampered := bytes.Clone(der)
+	tampered[bytes.Index(tampered, []byte("composite-csr"))] = 'k'
+	_, _, err = CompositeDraftRequest(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: tampered}), throwaway)
+	require.ErrorContains(t, err, "signature is not valid")
+}
+
+func TestCompositeRewriteKeepsClassicalSubject(t *testing.T) {
+	draftPEM, draft := compositeDraft(t)
+	issuer := compositeTestKey(t, 44)
+	issuerSKID, err := composite.SubjectKeyID(issuer.PublicKey())
+	require.NoError(t, err)
+
+	out, err := RewriteAsCompositeCertificate(draftPEM, nil, issuer, issuerSKID)
+	require.NoError(t, err)
+	block, _ := pem.Decode(out)
+	cert, err := x509.ParseCertificate(block.Bytes)
+	require.NoError(t, err)
+
+	require.NoError(t, composite.CheckCertificateSignature(cert, issuer.PublicKey()))
+	require.Equal(t, draft.RawSubjectPublicKeyInfo, cert.RawSubjectPublicKeyInfo)
+	require.Equal(t, draft.SubjectKeyId, cert.SubjectKeyId)
+	require.Equal(t, issuerSKID, cert.AuthorityKeyId)
 }

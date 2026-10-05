@@ -101,6 +101,9 @@ type CA struct {
 	issuer idemix.Issuer
 	// The options to use in verifying a signature in token-based authentication
 	verifyOptions *x509.VerifyOptions
+	// Opções de composite.VerifyChain, usadas quando a cadeia da CA tem composite.
+	compositeVerifyOptions composite.VerifyOptions
+	compositeChain         bool
 	// The attribute manager
 	attrMgr *attrmgr.Mgr
 	// The server hosting this CA
@@ -622,6 +625,16 @@ func (ca *CA) VerifyCertificate(cert *x509.Certificate, forceTime bool) error {
 		checkOpts.CurrentTime = cert.NotBefore.Add(time.Duration(time.Second * 30))
 	}
 
+	if ca.compositeChain || composite.IsSignedWithComposite(cert) {
+		compositeOpts := ca.compositeVerifyOptions
+		compositeOpts.CurrentTime = checkOpts.CurrentTime
+		_, err = composite.VerifyChain(cert, compositeOpts)
+		if err != nil {
+			return errors.WithMessage(err, "Failed to verify certificate")
+		}
+		return nil
+	}
+
 	_, err = cert.Verify(checkOpts)
 	if err != nil {
 		return errors.WithMessage(err, "Failed to verify certificate")
@@ -659,6 +672,9 @@ func (ca *CA) getVerifyOptions() (*x509.VerifyOptions, error) {
 		if !cert.IsCA {
 			return nil, errors.New("A certificate in the CA chain is not a CA certificate")
 		}
+		if composite.IsPKIXPublicKey(cert.RawSubjectPublicKeyInfo) || composite.IsSignedWithComposite(cert) {
+			ca.compositeChain = true
+		}
 
 		// If authority key id is not present or if it is present and equal to subject key id,
 		// then it is a root certificate
@@ -667,11 +683,13 @@ func (ca *CA) getVerifyOptions() (*x509.VerifyOptions, error) {
 				rootPool = x509.NewCertPool()
 			}
 			rootPool.AddCert(cert)
+			ca.compositeVerifyOptions.Roots = append(ca.compositeVerifyOptions.Roots, cert)
 		} else {
 			if intPool == nil {
 				intPool = x509.NewCertPool()
 			}
 			intPool.AddCert(cert)
+			ca.compositeVerifyOptions.Intermediates = append(ca.compositeVerifyOptions.Intermediates, cert)
 		}
 	}
 
@@ -680,6 +698,7 @@ func (ca *CA) getVerifyOptions() (*x509.VerifyOptions, error) {
 		Intermediates: intPool,
 		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
 	}
+	ca.compositeVerifyOptions.KeyUsages = ca.verifyOptions.KeyUsages
 	return ca.verifyOptions, nil
 }
 

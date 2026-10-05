@@ -7,8 +7,12 @@ SPDX-License-Identifier: Apache-2.0
 package util
 
 import (
+	"bytes"
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
@@ -53,6 +57,7 @@ type authorityKeyIdentifier struct {
 // RewriteAsCompositeCertificate transforma o rascunho que o cfssl emitiu com uma chave descartável
 // no certificado composite. Troca o SPKI, o algoritmo de assinatura e os identificadores de chave,
 // e assina o TBS inteiro com issuer. authorityKeyID substitui o AuthorityKeyId do rascunho, quando existe.
+// Com subject nil, o SPKI e o SubjectKeyId do rascunho não mudam.
 func RewriteAsCompositeCertificate(draftPEM []byte, subject *composite.PublicKey, issuer crypto.Signer, authorityKeyID []byte) ([]byte, error) {
 	issuerPub, ok := issuer.Public().(*composite.PublicKey)
 	if !ok {
@@ -71,24 +76,26 @@ func RewriteAsCompositeCertificate(draftPEM []byte, subject *composite.PublicKey
 		return nil, err
 	}
 
-	if tbs.SubjectPublicKeyInfo, err = composite.MarshalPKIXPublicKey(subject); err != nil {
-		return nil, err
-	}
 	algID, err := composite.AlgorithmIdentifier(issuerPub.Algorithm)
 	if err != nil {
 		return nil, err
 	}
 	tbs.SignatureAlgorithm = algID
 
-	skid, err := composite.SubjectKeyID(subject)
-	if err != nil {
-		return nil, err
+	if subject != nil {
+		if tbs.SubjectPublicKeyInfo, err = composite.MarshalPKIXPublicKey(subject); err != nil {
+			return nil, err
+		}
+		skid, err := composite.SubjectKeyID(subject)
+		if err != nil {
+			return nil, err
+		}
+		skidValue, err := asn1.Marshal(skid)
+		if err != nil {
+			return nil, err
+		}
+		tbs.SetExtension(pkix.Extension{Id: oidSubjectKeyID, Value: skidValue})
 	}
-	skidValue, err := asn1.Marshal(skid)
-	if err != nil {
-		return nil, err
-	}
-	tbs.SetExtension(pkix.Extension{Id: oidSubjectKeyID, Value: skidValue})
 	if _, found := tbs.Extension(oidAuthorityKeyID); found {
 		if len(authorityKeyID) == 0 {
 			return nil, errors.New("The draft certificate has an AuthorityKeyId but none was given for the composite issuer")
@@ -128,4 +135,154 @@ func GetCompositePrivateKey(raw []byte) (*composite.PrivateKey, error) {
 		return nil, errors.WithMessage(err, "Failed parsing Composite ML-DSA private key")
 	}
 	return key, nil
+}
+
+// Estruturas do PKCS #10 (RFC 2986).
+type certificationRequest struct {
+	Info               asn1.RawValue
+	SignatureAlgorithm asn1.RawValue
+	Signature          asn1.BitString
+}
+
+type certificationRequestInfo struct {
+	Version    int
+	Subject    asn1.RawValue
+	PublicKey  asn1.RawValue
+	Attributes asn1.RawValue
+}
+
+var oidECDSAWithSHA256 = asn1.ObjectIdentifier{1, 2, 840, 10045, 4, 3, 2}
+
+// compositeCSRDER monta um CSR com uma chave descartável e troca o SPKI pela chave composite.
+func compositeCSRDER(priv crypto.Signer, pub *composite.PublicKey, req *csr.CertificateRequest) ([]byte, error) {
+	throwaway, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, errors.WithMessage(err, "Failed to generate the throwaway key for the draft CSR")
+	}
+	draftDER, err := generateCSRDER(throwaway, req)
+	if err != nil {
+		return nil, err
+	}
+	draft, err := x509.ParseCertificateRequest(draftDER)
+	if err != nil {
+		return nil, errors.WithMessage(err, "Failed to parse the draft CSR")
+	}
+	spki, err := composite.MarshalPKIXPublicKey(pub)
+	if err != nil {
+		return nil, err
+	}
+	info, err := replaceCSRPublicKey(draft.RawTBSCertificateRequest, spki)
+	if err != nil {
+		return nil, err
+	}
+	algID, err := composite.AlgorithmIdentifier(pub.Algorithm)
+	if err != nil {
+		return nil, err
+	}
+	// CSRs usam ctx vazio.
+	signature, err := priv.Sign(rand.Reader, info, nil)
+	if err != nil {
+		return nil, errors.WithMessage(err, "Failed to sign the composite CSR")
+	}
+	log.Debugf("Composite: CSR signed with %s", pub.Algorithm.Label)
+	return assembleCSR(info, algID, signature)
+}
+
+// ParseCompositeCertificateRequest lê um CSR composite e verifica a assinatura com a chave do próprio CSR.
+func ParseCompositeCertificateRequest(der []byte) (*x509.CertificateRequest, *composite.PublicKey, error) {
+	var outer certificationRequest
+	if _, err := asn1.Unmarshal(der, &outer); err != nil {
+		return nil, nil, errors.WithMessage(err, "Failed to parse the composite CSR")
+	}
+	req, err := x509.ParseCertificateRequest(der)
+	if err != nil {
+		return nil, nil, errors.WithMessage(err, "Failed to parse the composite CSR")
+	}
+	pub, err := composite.ParsePKIXPublicKey(req.RawSubjectPublicKeyInfo)
+	if err != nil {
+		return nil, nil, err
+	}
+	algID, err := composite.AlgorithmIdentifier(pub.Algorithm)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !bytes.Equal(outer.SignatureAlgorithm.FullBytes, algID) {
+		return nil, nil, errors.Errorf("The CSR key is %s but the CSR signature algorithm is different", pub.Algorithm.Label)
+	}
+	if outer.Signature.BitLength%8 != 0 {
+		return nil, nil, errors.New("The composite CSR signature is not a whole number of bytes")
+	}
+	if err := composite.Verify(pub, req.RawTBSCertificateRequest, outer.Signature.Bytes, nil); err != nil {
+		return nil, nil, errors.WithMessage(err, "The composite CSR signature is not valid")
+	}
+	return req, pub, nil
+}
+
+// CompositeDraftRequest prepara o CSR que o cfssl recebe numa CA composite. Para um CSR composite,
+// verifica a assinatura e devolve a chave do subject e um rascunho igual ao CSR, mas com a chave
+// descartável no SPKI e assinado por ela. Um CSR de outro algoritmo volta sem mudança e com chave nil.
+func CompositeDraftRequest(csrPEM []byte, throwaway *ecdsa.PrivateKey) (*composite.PublicKey, []byte, error) {
+	block, _ := pem.Decode(csrPEM)
+	if block == nil {
+		return nil, nil, errors.New("Failed to decode the CSR: not valid PEM")
+	}
+	req, err := x509.ParseCertificateRequest(block.Bytes)
+	if err != nil {
+		return nil, nil, errors.WithMessage(err, "Failed to parse the CSR")
+	}
+	if !composite.IsPKIXPublicKey(req.RawSubjectPublicKeyInfo) {
+		return nil, csrPEM, nil
+	}
+	req, pub, err := ParseCompositeCertificateRequest(block.Bytes)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	spki, err := x509.MarshalPKIXPublicKey(&throwaway.PublicKey)
+	if err != nil {
+		return nil, nil, err
+	}
+	info, err := replaceCSRPublicKey(req.RawTBSCertificateRequest, spki)
+	if err != nil {
+		return nil, nil, err
+	}
+	digest := sha256.Sum256(info)
+	signature, err := ecdsa.SignASN1(rand.Reader, throwaway, digest[:])
+	if err != nil {
+		return nil, nil, err
+	}
+	algID, err := asn1.Marshal(pkix.AlgorithmIdentifier{Algorithm: oidECDSAWithSHA256})
+	if err != nil {
+		return nil, nil, err
+	}
+	der, err := assembleCSR(info, algID, signature)
+	if err != nil {
+		return nil, nil, err
+	}
+	return pub, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der}), nil
+}
+
+// replaceCSRPublicKey troca o SPKI de um CertificationRequestInfo e mantém os outros campos byte a byte.
+func replaceCSRPublicKey(infoDER, spki []byte) ([]byte, error) {
+	var info certificationRequestInfo
+	rest, err := asn1.Unmarshal(infoDER, &info)
+	if err != nil {
+		return nil, errors.WithMessage(err, "Failed to parse the CertificationRequestInfo")
+	}
+	if len(rest) != 0 {
+		return nil, errors.New("Trailing data after the CertificationRequestInfo")
+	}
+	if info.Version != 0 {
+		return nil, errors.Errorf("Unsupported CSR version %d", info.Version)
+	}
+	info.PublicKey = asn1.RawValue{FullBytes: spki}
+	return asn1.Marshal(info)
+}
+
+func assembleCSR(info, algID, signature []byte) ([]byte, error) {
+	return asn1.Marshal(certificationRequest{
+		Info:               asn1.RawValue{FullBytes: info},
+		SignatureAlgorithm: asn1.RawValue{FullBytes: algID},
+		Signature:          asn1.BitString{Bytes: signature, BitLength: 8 * len(signature)},
+	})
 }
