@@ -15,7 +15,6 @@ import (
 	"os"
 	"time"
 
-	"github.com/cloudflare/cfssl/crl"
 	"github.com/cloudflare/cfssl/log"
 	"github.com/hyperledger/fabric-ca/api"
 	"github.com/hyperledger/fabric-ca/lib/caerrors"
@@ -134,7 +133,7 @@ func genCRL(ca *CA, req api.GenCRLRequest) ([]byte, error) {
 		revokedCerts = append(revokedCerts, revokedCert)
 	}
 
-	crl, err := crl.CreateGenericCRL(revokedCerts, signer, caCert, expiry)
+	crl, err := createCRL(revokedCerts, signer, caCert, expiry)
 	if err != nil {
 		log.Errorf("Failed to generate CRL for CA '%s': %s", ca.HomeDir, err)
 		return nil, caerrors.NewHTTPErr(500, caerrors.ErrGenCRL, "Failed to generate CRL for CA '%s'", ca.HomeDir)

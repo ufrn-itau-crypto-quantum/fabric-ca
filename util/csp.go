@@ -151,6 +151,8 @@ func getBCCSPKeyOpts(kr *csr.KeyRequest, ephemeral bool) (opts bccsp.KeyGenOpts,
 		default:
 			return nil, errors.Errorf("Invalid MLDSA key size: %d", kr.Size())
 		}
+	case AlgoComposite:
+		return compositeKeyGenOpts(kr, ephemeral)
 	default:
 		return nil, errors.Errorf("Invalid algorithm: %s", kr.Algo())
 	}
