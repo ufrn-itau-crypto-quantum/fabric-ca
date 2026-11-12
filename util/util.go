@@ -33,7 +33,7 @@ import (
 	"github.com/cloudflare/cfssl/log"
 	"github.com/hyperledger/fabric-ca/lib/caerrors"
 	"github.com/hyperledger/fabric-lib-go/bccsp"
-	"github.com/hyperledger/fabric-lib-go/bccsp/composite"
+	"github.com/hyperledger/fabric-lib-go/bccsp/pkixext"
 	"github.com/pkg/errors"
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
@@ -148,8 +148,8 @@ func CreateToken(csp bccsp.BCCSP, cert []byte, key bccsp.Key, method, uri string
 	}
 	publicKey := x509Cert.PublicKey
 
-	if composite.IsPKIXPublicKey(x509Cert.RawSubjectPublicKeyInfo) {
-		log.Debugf("CreateToken: signing %s %s with the certificate's Composite ML-DSA key", method, uri)
+	if pkixext.IsExternalPublicKey(x509Cert.RawSubjectPublicKeyInfo) {
+		log.Debugf("CreateToken: signing %s %s with the certificate's external-algorithm key", method, uri)
 		return genToken(csp, cert, key, method, uri, body)
 	}
 

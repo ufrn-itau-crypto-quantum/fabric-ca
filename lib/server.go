@@ -28,6 +28,7 @@ import (
 	"github.com/felixge/httpsnoop"
 	ghandlers "github.com/gorilla/handlers"
 	gmux "github.com/gorilla/mux"
+	"github.com/hyperledger/fabric-ca/api"
 	"github.com/hyperledger/fabric-ca/lib/attr"
 	"github.com/hyperledger/fabric-ca/lib/caerrors"
 	calog "github.com/hyperledger/fabric-ca/lib/common/log"
@@ -39,6 +40,7 @@ import (
 	"github.com/hyperledger/fabric-ca/lib/server/operations"
 	stls "github.com/hyperledger/fabric-ca/lib/tls"
 	"github.com/hyperledger/fabric-ca/util"
+	"github.com/hyperledger/fabric-lib-go/bccsp/pkixext"
 	"github.com/hyperledger/fabric-lib-go/common/metrics"
 	"github.com/hyperledger/fabric-lib-go/healthz"
 	"github.com/pkg/errors"
@@ -696,6 +698,12 @@ func (s *Server) listenAndServe() (err error) {
 			CipherSuites: stls.DefaultCipherSuites,
 			KeyLogWriter: getTLSKeyLogWriter(),
 		}
+		// client chains that crypto/x509 cannot verify are verified by pkixext
+		if authType != defaultClientAuth {
+			if roots := stls.ExternalRootCAs(&stls.ClientTLSConfig{CertFiles: c.TLS.ClientAuth.CertFiles}); roots != nil {
+				pkixext.ConfigureServerVerification(config, roots)
+			}
+		}
 
 		listener, err = tls.Listen("tcp", addr, config)
 		if err != nil {
@@ -886,6 +894,9 @@ func (s *Server) autoGenerateTLSCertificateKey() error {
 	// Generate CSR that will be used to create the TLS certificate
 	csrReq := s.Config.CAcfg.CSR
 	csrReq.CA = nil // Not requesting a CA certificate
+	if kr := s.Config.TLS.KeyRequest; kr.Algo != "" {
+		csrReq.KeyRequest = &api.KeyRequest{Algo: kr.Algo, Size: kr.Size}
+	}
 	hostname := util.Hostname()
 	log.Debugf("TLS CSR: %+v\n", csrReq)
 

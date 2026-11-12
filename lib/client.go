@@ -39,6 +39,7 @@ import (
 	"github.com/hyperledger/fabric-ca/lib/tls"
 	"github.com/hyperledger/fabric-ca/util"
 	"github.com/hyperledger/fabric-lib-go/bccsp"
+	"github.com/hyperledger/fabric-lib-go/bccsp/pkixext"
 	cspsigner "github.com/hyperledger/fabric-lib-go/bccsp/signer"
 	"github.com/pkg/errors"
 )
@@ -193,6 +194,10 @@ func (c *Client) initHTTPClient() error {
 		// set the default ciphers
 		tlsConfig.CipherSuites = tls.DefaultCipherSuites
 		tr.TLSClientConfig = tlsConfig
+		// chains that crypto/x509 cannot verify are verified by pkixext on each connection
+		if roots := tls.ExternalRootCAs(&c.Config.TLS); roots != nil {
+			tr.DialTLSContext = pkixext.DialTLSContext(tlsConfig, roots)
+		}
 	}
 	c.httpClient = &http.Client{Transport: tr}
 	return nil

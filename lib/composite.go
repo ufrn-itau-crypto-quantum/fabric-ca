@@ -19,12 +19,12 @@ import (
 	"github.com/cloudflare/cfssl/signer"
 	cflocalsigner "github.com/cloudflare/cfssl/signer/local"
 	"github.com/hyperledger/fabric-ca/util"
-	"github.com/hyperledger/fabric-lib-go/bccsp/composite"
+	"github.com/hyperledger/fabric-lib-go/bccsp/pkixext"
 	"github.com/pkg/errors"
 )
 
-// signCertificate emite um certificado com o enrollSigner, ou pelo caminho composite quando a
-// chave da CA é Composite ML-DSA.
+// signCertificate issues a certificate with the enrollSigner, or through the external path when the
+// CA key is of a registered external algorithm, such as Composite ML-DSA or SLH-DSA.
 func (ca *CA) signCertificate(req signer.SignRequest) ([]byte, error) {
 	local, ok := ca.enrollSigner.(*cflocalsigner.Signer)
 	if !ok {
@@ -34,25 +34,25 @@ func (ca *CA) signCertificate(req signer.SignRequest) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if caCert == nil || !composite.IsPKIXPublicKey(caCert.RawSubjectPublicKeyInfo) {
+	if caCert == nil || !pkixext.IsExternalPublicKey(caCert.RawSubjectPublicKeyInfo) {
 		return ca.enrollSigner.Sign(req)
 	}
-	return ca.signCompositeCertificate(req, caCert)
+	return ca.signExternalCertificate(req, caCert)
 }
 
-// signCompositeCertificate emite com o cfssl um rascunho assinado por uma chave ECDSA descartável,
-// criada para esta emissão, e reescreve o rascunho com a assinatura composite da CA. O rascunho sai
-// com o emissor e o AuthorityKeyId da CA.
-func (ca *CA) signCompositeCertificate(req signer.SignRequest, caCert *x509.Certificate) ([]byte, error) {
+// signExternalCertificate has cfssl issue a draft signed by a throwaway ECDSA key, created for this
+// issuance, and rewrites the draft with the signature of the CA key. The draft carries the issuer
+// and the AuthorityKeyId of the CA.
+func (ca *CA) signExternalCertificate(req signer.SignRequest, caCert *x509.Certificate) ([]byte, error) {
 	_, caSigner, _, err := util.GetSignerFromCertFile(ca.Config.CA.Certfile, ca.csp)
 	if err != nil {
-		return nil, errors.WithMessage(err, "Failed to load the composite CA signer")
+		return nil, errors.WithMessage(err, "Failed to load the CA signer")
 	}
 	throwaway, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, errors.WithMessage(err, "Failed to generate the throwaway key for the draft certificate")
 	}
-	subject, draftCSR, err := util.CompositeDraftRequest([]byte(req.Request), throwaway)
+	subject, draftCSR, err := util.ExternalDraftRequest([]byte(req.Request), throwaway)
 	if err != nil {
 		return nil, err
 	}
@@ -68,7 +68,7 @@ func (ca *CA) signCompositeCertificate(req signer.SignRequest, caCert *x509.Cert
 		return nil, err
 	}
 
-	cert, err := util.RewriteAsCompositeCertificate(draft, subject, caSigner, caCert.SubjectKeyId)
+	cert, err := util.RewriteAsExternalCertificate(draft, subject, caSigner, caCert.SubjectKeyId)
 	if err != nil {
 		return nil, err
 	}
@@ -78,10 +78,10 @@ func (ca *CA) signCompositeCertificate(req signer.SignRequest, caCert *x509.Cert
 	return cert, nil
 }
 
-// createCRL gera a CRL DER com o cfssl. Com uma chave composite, o cfssl assina com uma chave ECDSA
-// descartável, e a CRL é reescrita com a assinatura composite.
+// createCRL generates the DER CRL with cfssl. With a key of a registered external algorithm, cfssl
+// signs with a throwaway ECDSA key and the CRL is rewritten with the signature of the CA key.
 func createCRL(revoked []pkix.RevokedCertificate, caSigner crypto.Signer, caCert *x509.Certificate, expiry time.Time) ([]byte, error) {
-	if _, ok := caSigner.Public().(*composite.PublicKey); !ok {
+	if _, ok := pkixext.SchemeForKey(caSigner.Public()); !ok {
 		return crl.CreateGenericCRL(revoked, caSigner, caCert, expiry)
 	}
 	throwaway, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -92,5 +92,5 @@ func createCRL(revoked []pkix.RevokedCertificate, caSigner crypto.Signer, caCert
 	if err != nil {
 		return nil, err
 	}
-	return util.RewriteAsCompositeCRL(draft, caSigner)
+	return util.RewriteAsExternalCRL(draft, caSigner)
 }

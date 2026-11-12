@@ -154,6 +154,9 @@ func getBCCSPKeyOpts(kr *csr.KeyRequest, ephemeral bool) (opts bccsp.KeyGenOpts,
 	case AlgoComposite:
 		return compositeKeyGenOpts(kr, ephemeral)
 	default:
+		if strings.HasPrefix(kr.Algo(), AlgoSLHDSAPrefix) || strings.HasPrefix(kr.Algo(), AlgoCompositeSLHDSAPrefix) {
+			return slhdsaKeyGenOpts(kr, ephemeral)
+		}
 		return nil, errors.Errorf("Invalid algorithm: %s", kr.Algo())
 	}
 }

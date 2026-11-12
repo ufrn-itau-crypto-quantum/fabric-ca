@@ -22,7 +22,6 @@ import (
 	cferr "github.com/cloudflare/cfssl/errors"
 	"github.com/cloudflare/cfssl/helpers"
 	"github.com/cloudflare/cfssl/log"
-	"github.com/hyperledger/fabric-lib-go/bccsp/composite"
 )
 
 // GenerateCSR creates a PEM encoded CSR from a CertificateRequest and an existing key.
@@ -45,8 +44,8 @@ func GenerateCSR(priv crypto.Signer, req *csr.CertificateRequest) ([]byte, error
 }
 
 func generateCSRDER(priv crypto.Signer, req *csr.CertificateRequest) ([]byte, error) {
-	if pub, ok := priv.Public().(*composite.PublicKey); ok {
-		return compositeCSRDER(priv, pub, req)
+	if pub := priv.Public(); isExternalPublicKey(pub) {
+		return externalCSRDER(priv, pub, req)
 	}
 	sigAlgo, err := csrSigAlgo(priv)
 	if err != nil {

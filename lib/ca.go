@@ -54,7 +54,7 @@ import (
 	"github.com/hyperledger/fabric-ca/lib/tls"
 	"github.com/hyperledger/fabric-ca/util"
 	"github.com/hyperledger/fabric-lib-go/bccsp"
-	"github.com/hyperledger/fabric-lib-go/bccsp/composite"
+	"github.com/hyperledger/fabric-lib-go/bccsp/pkixext"
 	cspsigner "github.com/hyperledger/fabric-lib-go/bccsp/signer"
 	"github.com/pkg/errors"
 
@@ -101,9 +101,9 @@ type CA struct {
 	issuer idemix.Issuer
 	// The options to use in verifying a signature in token-based authentication
 	verifyOptions *x509.VerifyOptions
-	// Opções de composite.VerifyChain, usadas quando a cadeia da CA tem composite.
-	compositeVerifyOptions composite.VerifyOptions
-	compositeChain         bool
+	// Options of pkixext.VerifyChain, used when the CA chain has a key or signature outside crypto/x509.
+	extVerifyOptions pkixext.VerifyOptions
+	extChain         bool
 	// The attribute manager
 	attrMgr *attrmgr.Mgr
 	// The server hosting this CA
@@ -382,8 +382,8 @@ func (ca *CA) getCACert() (cert []byte, err error) {
 			extensions = append(extensions, ext)
 		}
 
-		if util.IsCompositeKeyRequest(req.KeyRequest) {
-			cert, err = newSelfSignedCompositeCACert(&req, cspSigner)
+		if util.IsExternalKeyRequest(req.KeyRequest) {
+			cert, err = newSelfSignedExternalCACert(&req, cspSigner)
 		} else {
 			cert, err = newSelfSignedCACert(&req, cspSigner, extensions)
 		}
@@ -466,12 +466,12 @@ func newSelfSignedCACert(req *cfcsr.CertificateRequest, priv crypto.Signer, exte
 	})
 }
 
-// newSelfSignedCompositeCACert emite com o cfssl um rascunho assinado por uma chave ECDSA descartável
-// e reescreve o rascunho com a chave composta.
-func newSelfSignedCompositeCACert(req *cfcsr.CertificateRequest, priv crypto.Signer) ([]byte, error) {
-	pub, ok := priv.Public().(*composite.PublicKey)
-	if !ok {
-		return nil, errors.Errorf("Composite CA key must be a Composite ML-DSA key, got %T", priv.Public())
+// newSelfSignedExternalCACert has cfssl issue a draft signed by a throwaway ECDSA key and rewrites
+// the draft with the CA key, which must be of a registered external algorithm.
+func newSelfSignedExternalCACert(req *cfcsr.CertificateRequest, priv crypto.Signer) ([]byte, error) {
+	pub := priv.Public()
+	if _, ok := pkixext.SchemeForKey(pub); !ok {
+		return nil, errors.Errorf("CA key must be of a registered external algorithm, got %T", pub)
 	}
 	throwaway, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -481,11 +481,11 @@ func newSelfSignedCompositeCACert(req *cfcsr.CertificateRequest, priv crypto.Sig
 	if err != nil {
 		return nil, err
 	}
-	skid, err := composite.SubjectKeyID(pub)
+	skid, err := pkixext.SubjectKeyID(pub)
 	if err != nil {
 		return nil, err
 	}
-	return util.RewriteAsCompositeCertificate(draft, pub, priv, skid)
+	return util.RewriteAsExternalCertificate(draft, pub, priv, skid)
 }
 
 // Return a certificate chain which is the concatenation of chain and cert
@@ -625,10 +625,10 @@ func (ca *CA) VerifyCertificate(cert *x509.Certificate, forceTime bool) error {
 		checkOpts.CurrentTime = cert.NotBefore.Add(time.Duration(time.Second * 30))
 	}
 
-	if ca.compositeChain || composite.IsSignedWithComposite(cert) {
-		compositeOpts := ca.compositeVerifyOptions
-		compositeOpts.CurrentTime = checkOpts.CurrentTime
-		_, err = composite.VerifyChain(cert, compositeOpts)
+	if ca.extChain || pkixext.IsSignedWithExternal(cert) {
+		extOpts := ca.extVerifyOptions
+		extOpts.CurrentTime = checkOpts.CurrentTime
+		_, err = pkixext.VerifyChain(cert, extOpts)
 		if err != nil {
 			return errors.WithMessage(err, "Failed to verify certificate")
 		}
@@ -672,8 +672,8 @@ func (ca *CA) getVerifyOptions() (*x509.VerifyOptions, error) {
 		if !cert.IsCA {
 			return nil, errors.New("A certificate in the CA chain is not a CA certificate")
 		}
-		if composite.IsPKIXPublicKey(cert.RawSubjectPublicKeyInfo) || composite.IsSignedWithComposite(cert) {
-			ca.compositeChain = true
+		if pkixext.IsExternalPublicKey(cert.RawSubjectPublicKeyInfo) || pkixext.IsSignedWithExternal(cert) {
+			ca.extChain = true
 		}
 
 		// If authority key id is not present or if it is present and equal to subject key id,
@@ -683,13 +683,13 @@ func (ca *CA) getVerifyOptions() (*x509.VerifyOptions, error) {
 				rootPool = x509.NewCertPool()
 			}
 			rootPool.AddCert(cert)
-			ca.compositeVerifyOptions.Roots = append(ca.compositeVerifyOptions.Roots, cert)
+			ca.extVerifyOptions.Roots = append(ca.extVerifyOptions.Roots, cert)
 		} else {
 			if intPool == nil {
 				intPool = x509.NewCertPool()
 			}
 			intPool.AddCert(cert)
-			ca.compositeVerifyOptions.Intermediates = append(ca.compositeVerifyOptions.Intermediates, cert)
+			ca.extVerifyOptions.Intermediates = append(ca.extVerifyOptions.Intermediates, cert)
 		}
 	}
 
@@ -698,7 +698,7 @@ func (ca *CA) getVerifyOptions() (*x509.VerifyOptions, error) {
 		Intermediates: intPool,
 		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
 	}
-	ca.compositeVerifyOptions.KeyUsages = ca.verifyOptions.KeyUsages
+	ca.extVerifyOptions.KeyUsages = ca.verifyOptions.KeyUsages
 	return ca.verifyOptions, nil
 }
 
@@ -1333,16 +1333,16 @@ func validateMatchingKeys(cert *x509.Certificate, keyFile string) error {
 		return err
 	}
 
-	if composite.IsPKIXPublicKey(cert.RawSubjectPublicKeyInfo) {
-		pubKey, err := composite.ParsePKIXPublicKey(cert.RawSubjectPublicKeyInfo)
+	if pkixext.IsExternalPublicKey(cert.RawSubjectPublicKeyInfo) {
+		pubKey, err := pkixext.ParsePKIXPublicKey(cert.RawSubjectPublicKeyInfo)
 		if err != nil {
 			return err
 		}
-		privKey, err := util.GetCompositePrivateKey(keyPEM)
+		privKey, err := util.GetExternalPrivateKey(keyPEM)
 		if err != nil {
 			return err
 		}
-		if !privKey.PublicKey().Equal(pubKey) {
+		if pub, ok := privKey.Public().(interface{ Equal(crypto.PublicKey) bool }); !ok || !pub.Equal(pubKey) {
 			return errors.New("Public key and private key do not match")
 		}
 		return nil

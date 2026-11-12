@@ -62,6 +62,15 @@ github.com/cloudflare/cfssl/signer
 github.com/cloudflare/cfssl/signer/local
 github.com/cloudflare/cfssl/signer/remote
 github.com/cloudflare/cfssl/signer/universal
+# github.com/cloudflare/circl v1.6.5
+## explicit; go 1.25.0
+github.com/cloudflare/circl/internal/conv
+github.com/cloudflare/circl/internal/sha3
+github.com/cloudflare/circl/sign
+github.com/cloudflare/circl/sign/slhdsa
+github.com/cloudflare/circl/simd/keccakf1600
+github.com/cloudflare/circl/xof
+github.com/cloudflare/circl/xof/k12
 # github.com/consensys/gnark-crypto v0.19.2
 ## explicit; go 1.23.0
 github.com/consensys/gnark-crypto/ecc
@@ -176,7 +185,9 @@ github.com/hyperledger/fabric-lib-go/bccsp
 github.com/hyperledger/fabric-lib-go/bccsp/composite
 github.com/hyperledger/fabric-lib-go/bccsp/factory
 github.com/hyperledger/fabric-lib-go/bccsp/pkcs11
+github.com/hyperledger/fabric-lib-go/bccsp/pkixext
 github.com/hyperledger/fabric-lib-go/bccsp/signer
+github.com/hyperledger/fabric-lib-go/bccsp/slhdsa
 github.com/hyperledger/fabric-lib-go/bccsp/sw
 github.com/hyperledger/fabric-lib-go/bccsp/utils
 github.com/hyperledger/fabric-lib-go/common/flogging
@@ -412,10 +423,11 @@ go.yaml.in/yaml/v3
 ## explicit; go 1.18
 go.yaml.in/yaml/v4
 go.yaml.in/yaml/v4/internal/libyaml
-# golang.org/x/crypto v0.52.0
+# golang.org/x/crypto v0.54.0
 ## explicit; go 1.25.0
 golang.org/x/crypto/bcrypt
 golang.org/x/crypto/blake2b
+golang.org/x/crypto/blake2s
 golang.org/x/crypto/blowfish
 golang.org/x/crypto/cryptobyte
 golang.org/x/crypto/cryptobyte/asn1
@@ -424,22 +436,23 @@ golang.org/x/crypto/md4
 golang.org/x/crypto/ocsp
 golang.org/x/crypto/pkcs12
 golang.org/x/crypto/pkcs12/internal/rc2
-# golang.org/x/net v0.55.0
+golang.org/x/crypto/sha3
+# golang.org/x/net v0.56.0
 ## explicit; go 1.25.0
 golang.org/x/net/context/ctxhttp
 golang.org/x/net/html
 golang.org/x/net/html/atom
 golang.org/x/net/html/charset
 golang.org/x/net/idna
-# golang.org/x/sync v0.20.0
+# golang.org/x/sync v0.22.0
 ## explicit; go 1.25.0
 golang.org/x/sync/semaphore
-# golang.org/x/sys v0.45.0
+# golang.org/x/sys v0.47.0
 ## explicit; go 1.25.0
 golang.org/x/sys/cpu
 golang.org/x/sys/unix
 golang.org/x/sys/windows
-# golang.org/x/text v0.37.0
+# golang.org/x/text v0.40.0
 ## explicit; go 1.25.0
 golang.org/x/text/encoding
 golang.org/x/text/encoding/charmap
