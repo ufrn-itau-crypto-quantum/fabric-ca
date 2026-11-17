@@ -30,6 +30,10 @@
 PROJECT_NAME = fabric-ca
 
 GO_VER ?= $(shell go list -m toolchain | cut -c13-)
+# Build tags of bin/ and of the image binaries, and image that provides the Go toolchain of the
+# image build (see images/fabric-ca/Dockerfile).
+BUILD_GO_TAGS ?= pkcs11
+GO_IMAGE ?= golang:$(GO_VER)
 UBUNTU_VER ?= 22.04
 DEBIAN_VER ?= stretch
 BASE_VERSION ?= v1.5.21
@@ -103,7 +107,7 @@ fabric-ca-server: bin/fabric-ca-server
 
 bin/%: $(GO_SOURCE)
 	@echo "Building ${@F} in bin directory ..."
-	@mkdir -p bin && go build -o bin/${@F} -tags "pkcs11" -ldflags "$(GO_LDFLAGS)" $(PKGNAME)/$(path-map.${@F})
+	@mkdir -p bin && go build -o bin/${@F} -tags "$(BUILD_GO_TAGS)" -ldflags "$(GO_LDFLAGS)" $(PKGNAME)/$(path-map.${@F})
 	@echo "Built bin/${@F}"
 
 build/image/fabric-ca/$(DUMMY):
@@ -112,7 +116,8 @@ build/image/fabric-ca/$(DUMMY):
 	@echo "Docker:  building $(TARGET) image"
 	$(DBUILD) -f images/$(TARGET)/Dockerfile \
 		--build-arg GO_VER=${GO_VER} \
-		--build-arg GO_TAGS=pkcs11 \
+		--build-arg GO_TAGS="${BUILD_GO_TAGS}" \
+		--build-arg GO_IMAGE=${GO_IMAGE} \
 		--build-arg GO_LDFLAGS="${DOCKER_GO_LDFLAGS}" \
 		--build-arg UBUNTU_VER=${UBUNTU_VER} \
 		--build-arg TARGETARCH=$(ARCH) \
@@ -128,7 +133,8 @@ build/image/fabric-ca-fvt/$(DUMMY):
 	@echo "Docker:  building $(TARGET) image"
 	$(DBUILD) -f images/$(TARGET)/Dockerfile \
 		--build-arg GO_VER=${GO_VER} \
-		--build-arg GO_TAGS=pkcs11 \
+		--build-arg GO_TAGS="${BUILD_GO_TAGS}" \
+		--build-arg GO_IMAGE=${GO_IMAGE} \
 		--build-arg GO_LDFLAGS="${DOCKER_GO_LDFLAGS}" \
 		--build-arg PG_VER=${PG_VER} \
 		--build-arg TARGETARCH=$(ARCH) \

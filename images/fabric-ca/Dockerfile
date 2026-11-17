@@ -8,6 +8,13 @@
 # Build image
 ###############################################################################
 
+# GO_IMAGE provides /usr/local/go: the official golang image by default, or the go-tlsext image of
+# blockchain/src/go-tlsext, whose crypto/tls accepts registered signature schemes.
+ARG GO_VER
+ARG GO_IMAGE=golang:${GO_VER}
+ARG UBUNTU_VER
+FROM ${GO_IMAGE} AS go
+
 ARG UBUNTU_VER
 FROM ubuntu:${UBUNTU_VER} AS builder
 
@@ -24,8 +31,8 @@ RUN apt update && apt install -y \
     curl \
     make
 
-RUN curl -sL https://go.dev/dl/go${GO_VER}.${TARGETOS}-${TARGETARCH}.tar.gz | tar zxf - -C /usr/local
-ENV GOBIN="/usr/local/go/bin"
+COPY --from=go /usr/local/go /usr/local/go
+ENV GOBIN="/usr/local/go/bin" GOTOOLCHAIN=local
 ENV PATH="$GOBIN:$PATH"
 
 ADD . /build/fabric-ca

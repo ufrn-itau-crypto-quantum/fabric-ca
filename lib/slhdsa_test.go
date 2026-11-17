@@ -218,17 +218,24 @@ func TestSLHDSAEnrollment(t *testing.T) {
 	require.Equal(t, classic.SerialNumber, crl.TBSCertList.RevokedCertificates[0].SerialNumber)
 }
 
-// TestSLHDSATLSPKI mirrors the TLS PKI of the runner: a root and an intermediate with SLH-DSA keys,
-// both serving TLS with the ML-DSA certificate each generates for itself, the intermediate enrolling
-// with the root over TLS, and a client enrolling with the intermediate over TLS.
+// TestSLHDSATLSPKI mirrors the TLS PKI of the runner with the ML-DSA leaf of the phase 7 ablation:
+// a root and an intermediate with SLH-DSA keys, both serving TLS with the ML-DSA certificate each
+// generates for itself, the intermediate enrolling with the root over TLS, and a client enrolling
+// with the intermediate over TLS.
 func TestSLHDSATLSPKI(t *testing.T) {
+	testTLSPKI(t, &api.KeyRequest{Algo: "slhdsa-sha2-f", Size: 128}, stls.KeyRequest{Algo: util.AlgoMLDSA, Size: 44}, x509.MLDSA)
+}
+
+// testTLSPKI runs the TLS PKI of the runner with ca as the key of the root and the intermediate and
+// tlsLeaf as the key of every TLS leaf, and checks that the certificates the servers generate have
+// the public key algorithm leafAlgorithm.
+func testTLSPKI(t *testing.T, ca *api.KeyRequest, tlsLeaf stls.KeyRequest, leafAlgorithm x509.PublicKeyAlgorithm) {
 	const rootPort, interPort = 7091, 7092
 	rootHome := path.Join(serversDir, "slhdsatlsroot")
 	interHome := path.Join(serversDir, "slhdsatlsinter")
 	defer os.RemoveAll(rootHome)
 	defer os.RemoveAll(interHome)
-	slh := &api.KeyRequest{Algo: "slhdsa-sha2-f", Size: 128}
-	tlsLeaf := stls.KeyRequest{Algo: util.AlgoMLDSA, Size: 44}
+	slh := ca
 
 	root := TestGetServer(rootPort, rootHome, "", -1, t)
 	require.NotNil(t, root)
@@ -246,7 +253,7 @@ func TestSLHDSATLSPKI(t *testing.T) {
 	require.NoError(t, err)
 	tlsCert, err := util.GetX509CertificateFromPEMFile(root.Config.TLS.CertFile)
 	require.NoError(t, err)
-	require.Equal(t, x509.MLDSA, tlsCert.PublicKeyAlgorithm, "the TLS certificate follows tls.keyrequest")
+	require.Equal(t, leafAlgorithm, tlsCert.PublicKeyAlgorithm, "the TLS certificate follows tls.keyrequest")
 	require.NoError(t, pkixext.CheckCertificateSignature(tlsCert, rootPub))
 
 	inter := TestGetServer(interPort, interHome, fmt.Sprintf("https://admin:adminpw@localhost:%d", rootPort), -1, t)
@@ -276,7 +283,7 @@ func TestSLHDSATLSPKI(t *testing.T) {
 		cfg := &ClientConfig{
 			URL: fmt.Sprintf("https://localhost:%d", interPort),
 			TLS: stls.ClientTLSConfig{Enabled: true, CertFiles: []string{trustFile}},
-			CSR: api.CSRInfo{KeyRequest: &api.KeyRequest{Algo: util.AlgoMLDSA, Size: 44}},
+			CSR: api.CSRInfo{KeyRequest: &api.KeyRequest{Algo: tlsLeaf.Algo, Size: tlsLeaf.Size}},
 		}
 		_, err := cfg.Enroll(fmt.Sprintf("https://admin:adminpw@localhost:%d", interPort), t.TempDir())
 		return err

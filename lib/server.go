@@ -179,6 +179,7 @@ func (s *Server) startOperationsServer() error {
 // Start the fabric-ca server
 func (s *Server) Start() (err error) {
 	log.Infof("Starting server in home directory: %s", s.HomeDir)
+	log.Info(pkixext.TLSSchemesLog())
 
 	s.serveError = nil
 
